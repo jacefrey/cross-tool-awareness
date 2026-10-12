@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cross-tool-awareness"
+version = "0.1.0"
+description = "Shared storage + dispatcher primitives for cross-tool awareness between Codex and Claude Code sessions on a single Mac. Owned by machine-manager."
+requires-python = ">=3.12"
+readme = "README.md"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cross_tool_awareness = ["schema.sql"]

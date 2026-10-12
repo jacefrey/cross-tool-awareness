@@ -1,0 +1,25 @@
+# cross-tool-awareness package manifest
+#
+# Design authority (lives in machine-manager, the owning project):
+#   machine-manager/docs/superpowers/specs/2026-10-11-shared-awareness-package-design.md
+#
+# Contract authority (lives in codex-manager, the consuming adapter's owner):
+#   codex-manager/docs/superpowers/specs/2026-10-05-codex-gate1-contracts.md
+#   (commit 0087ebe)
+#
+# package_sha256 covers the complete tracked package tree, with this field's
+# value deterministically zeroed during hashing. Writing the computed digest
+# into this field therefore does not change the digest. See the design spec §13
+# and §13.1 (release sequence).
+
+format_version = 1
+
+design_spec = "machine-manager/docs/superpowers/specs/2026-10-11-shared-awareness-package-design.md"
+
+contracts_source = "codex-manager/docs/superpowers/specs/2026-10-05-codex-gate1-contracts.md"
+contracts_source_commit = "0087ebe"
+
+package_version = "0.1.0"
+package_sha256 = "553c5a132f65ac48bd43c043cd007cca7ce0352fa662b1c5e30e73a0a5419d82"
+
+changelog_heading = "Changelog"
