@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.1 (2026-10-12)
+
+Point release correcting a version-constant drift surfaced by machine-manager's
+Task 9 independent review of codex-manager's Gate #1 composite (finding L4).
+No API, schema, or behavior changes.
+
+- **src/cross_tool_awareness/__init__.py:83** — `__version__` was `"0.2.0"`,
+  stale from the v0.2.0 → v0.3.0 release that bumped `pyproject.toml` and
+  `manifest.toml` but missed the module-level constant. Now `"0.3.1"`.
+- **src/cross_tool_awareness/__init__.py:6** — module docstring claimed
+  `"v0.2.0. Fixture-only."`; same drift. Now `"v0.3.1. Fixture-only."`.
+
+A naive Python-side fence (`cross_tool_awareness.__version__ == "0.3.0"`) would
+have fail-closed against the correctly-released v0.3.0 build. The 0.3.0 package
+tree at commit `bd8cfe031471197c3d0697997c75f8c43b14b159` remains an accepted
+checkout for anything that pins by git SHA; this release updates the Python
+constant so a `.__version__` check can work.
+
 ## 0.3.0 (2026-10-12)
 
 Remediation of codex-manager's seq=195 package review (durable at codex-manager
