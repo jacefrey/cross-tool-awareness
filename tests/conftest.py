@@ -1,10 +1,11 @@
 """Shared pytest fixtures.
 
-Produces a fresh in-memory SQLite with the awareness schema applied for each test.
-Includes a stub `messages` table so the FK on targeted_deliveries resolves.
+v0.2.0: dataclasses now store UUID objects (normalized at construction).
+Fixtures create UUIDs via uuid.uuid4().
 """
 
-import os
+from __future__ import annotations
+
 import sqlite3
 import sys
 import uuid
@@ -12,7 +13,6 @@ from pathlib import Path
 
 import pytest
 
-# Ensure src/ is importable when running tests from the package root
 _PKG_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PKG_ROOT / "src"))
 
@@ -33,7 +33,6 @@ def _schema_sql() -> str:
 
 @pytest.fixture
 def db() -> sqlite3.Connection:
-    """Fresh in-memory DB with awareness schema + stub messages table."""
     conn = sqlite3.connect(":memory:")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(_STUB_MESSAGES_DDL)
@@ -45,7 +44,6 @@ def db() -> sqlite3.Connection:
 
 @pytest.fixture
 def file_db(tmp_path) -> Path:
-    """File-backed empty bridge DB (for migration + backup tests)."""
     path = tmp_path / "bridge.db"
     conn = sqlite3.connect(str(path))
     conn.execute("PRAGMA foreign_keys = ON")
@@ -56,7 +54,6 @@ def file_db(tmp_path) -> Path:
 
 @pytest.fixture
 def file_db_migrated(file_db, tmp_path) -> Path:
-    """File-backed bridge DB with awareness schema applied."""
     from cross_tool_awareness import apply as apply_migration
     backup_dir = tmp_path / "backups"
     result = apply_migration(file_db, backup_dir=backup_dir, now=1_000_000)
@@ -64,23 +61,19 @@ def file_db_migrated(file_db, tmp_path) -> Path:
     return file_db
 
 
-def _u() -> str:
-    return str(uuid.uuid4())
-
-
 def make_presence(**overrides) -> PresenceRecord:
     defaults = dict(
-        session_uuid=_u(),
-        session_incarnation_id=_u(),
-        alias="test-alias-" + _u()[:8],
+        session_uuid=uuid.uuid4(),
+        session_incarnation_id=uuid.uuid4(),
+        alias="test-alias-" + uuid.uuid4().hex[:8],
         tool="codex",
         project_slug="test-project",
         project_root="/tmp/test-project",
         role="manager",
         state="idle",
         wake_capability="codex_queue",
-        registration_fence="fence-" + _u()[:8],
-        wake_locator="locator-" + _u()[:8],
+        registration_fence="fence-" + uuid.uuid4().hex[:8],
+        wake_locator="locator-" + uuid.uuid4().hex[:8],
         started_at=1_000_000,
         heartbeat_at=1_000_010,
         expires_at=1_000_000 + 86400,
@@ -100,9 +93,8 @@ def insert_message(db: sqlite3.Connection, message_id: str) -> None:
 
 @pytest.fixture
 def msg(db):
-    """Helper to insert and return a new message_id."""
     def _msg():
-        mid = _u()
+        mid = str(uuid.uuid4())
         insert_message(db, mid)
         return mid
     return _msg
@@ -110,4 +102,13 @@ def msg(db):
 
 @pytest.fixture
 def new_uuid():
+    def _u():
+        return str(uuid.uuid4())
+    return _u
+
+
+@pytest.fixture
+def new_uuid_obj():
+    def _u():
+        return uuid.uuid4()
     return _u

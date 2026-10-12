@@ -27,7 +27,7 @@ def _insert_delivery(db, *, message_id, target_uuid, target_incarnation,
         " sender_session_uuid, sender_session_incarnation_id, delivery_state, "
         " created_at, next_attempt_at, expires_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (message_id, target_uuid, target_incarnation,
+        (message_id, str(target_uuid), str(target_incarnation),
          _u(), _u(), delivery_state, now, now, expires_at),
     )
 

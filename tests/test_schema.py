@@ -111,7 +111,7 @@ def test_register_session_retires_expired(db, make_presence_fn):
     # p1 should be revoked, p2 should be live
     live = [r for r in rows if r["revoked_at"] is None]
     assert len(live) == 1
-    assert live[0]["session_uuid"] == p2.session_uuid
+    assert live[0]["session_uuid"] == str(p2.session_uuid)
 
 
 def test_capability_verifier_length_trigger(db):

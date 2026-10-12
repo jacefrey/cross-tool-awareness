@@ -1,31 +1,39 @@
-"""Narrow tool-specific interface the dispatcher invokes to deliver a notice."""
+"""Narrow tool-specific interface the dispatcher invokes to deliver a notice.
+
+WakeNotice sanitizes its summary via contracts.validate_notice_summary at
+construction: unsafe input becomes '[summary omitted]' rather than raising,
+matching codex-manager's contract behavior.
+"""
+
+from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from uuid import UUID
 
-from . import validation as validate
+from . import contracts
 
 
 @dataclass(frozen=True)
 class WakeNotice:
     """Minimal fixed-template notice. Full payload remains in the bridge messages table."""
 
-    message_id: str
+    message_id: object
     channel: str
     sender_alias_at_send: str
     summary: str
 
     def __post_init__(self) -> None:
-        validate.uuid(self.message_id, field="message_id")
-        validate.nonempty(self.channel, field="channel")
-        validate.nonempty(self.sender_alias_at_send, field="sender_alias_at_send")
-        # Summary is bounded; validation.summary_bounded returns the input or
-        # '[summary omitted]' — but since this is a frozen dataclass, callers
-        # should pre-filter via validation.summary_bounded() before constructing.
-        if not isinstance(self.summary, str):
-            raise ValueError("summary must be str")
-        if len(self.summary) > 160:
-            raise ValueError("summary must be <= 160 chars")
+        object.__setattr__(self, "message_id", contracts._exact_uuid(self.message_id, "message_id"))
+        if not isinstance(self.channel, str) or not self.channel:
+            raise ValueError("channel must be a nonempty string")
+        if not isinstance(self.sender_alias_at_send, str) or not self.sender_alias_at_send:
+            raise ValueError("sender_alias_at_send must be a nonempty string")
+        object.__setattr__(
+            self,
+            "summary",
+            contracts.validate_notice_summary(self.summary),
+        )
 
 
 class WakeAdapter(ABC):
@@ -43,8 +51,8 @@ class WakeAdapter(ABC):
     @abstractmethod
     def wake(
         self,
-        target_session_uuid: str,
-        target_session_incarnation_id: str,
+        target_session_uuid,
+        target_session_incarnation_id,
         notice: WakeNotice,
     ) -> str:
         """Deliver a notice. Returns a QueueOutcome value as a string.

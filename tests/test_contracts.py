@@ -1,18 +1,25 @@
-"""Contract dataclass tests (§12.2)."""
+"""Contract dataclass tests (§12.2) — v0.2.0 shapes."""
+
+from __future__ import annotations
 
 import uuid as _uuid
+from uuid import UUID
 
 import pytest
 
 from cross_tool_awareness import (
+    CapabilityDecision,
+    DeliveryState,
+    Disposition,
     DispositionReceipt,
     PresenceRecord,
     PresenceState,
     QueueAttempt,
+    QueueCapability,
     QueueOutcome,
-    Disposition,
-    DeliveryState,
     RegistrationUpdate,
+    SUMMARY_OMITTED,
+    validate_notice_summary,
 )
 
 
@@ -40,8 +47,13 @@ def test_presence_rejects_timestamp_invariant_violation(make_presence_fn):
         make_presence_fn(started_at=100, heartbeat_at=50, expires_at=200)
 
 
-def test_registration_update_rejects_stale_state(make_presence_fn):
-    # 'stale' is storage-derived, not an update value
+def test_presence_normalizes_uuid_to_uuid_object(make_presence_fn):
+    p = make_presence_fn()
+    assert isinstance(p.session_uuid, UUID)
+    assert isinstance(p.session_incarnation_id, UUID)
+
+
+def test_registration_update_rejects_stale_state():
     with pytest.raises(ValueError):
         RegistrationUpdate(
             session_uuid=_u(),
@@ -92,12 +104,10 @@ def test_queue_attempt_rejects_control_chars_in_reason():
         )
 
 
-def test_disposition_receipt_rejects_unevaluated():
+def test_disposition_receipt_8_fields_rejects_unevaluated():
     with pytest.raises(ValueError):
         DispositionReceipt(
             message_id=_u(),
-            target_session_uuid=_u(),
-            target_session_incarnation_id=_u(),
             correlation_id=_u(),
             consumer_id="c",
             receiver_session_uuid=_u(),
@@ -105,57 +115,102 @@ def test_disposition_receipt_rejects_unevaluated():
             disposition="unevaluated",
             observed_at=1,
             reason="r",
-            delivered_at=1,
         )
 
 
-def test_disposition_receipt_rejects_receiver_target_mismatch():
-    tgt_uuid = _u()
-    tgt_inc = _u()
+def test_disposition_receipt_matches_method():
+    """8-field receipt matches() lookup used by codex-manager receiver code."""
+    mid = _u()
+    sid = _u()
+    inc = _u()
+    r = DispositionReceipt(
+        message_id=mid,
+        correlation_id=_u(),
+        consumer_id="c",
+        receiver_session_uuid=sid,
+        receiver_session_incarnation_id=inc,
+        disposition="accepted",
+        observed_at=1,
+        reason="",
+    )
+    assert r.matches(mid, "c", sid, inc) is True
+    assert r.matches(mid, "wrong", sid, inc) is False
+
+
+def test_enum_str_subclass_equals_wire_token():
+    """`str, Enum` subclasses: direct equality with wire token works via str
+    inheritance; .value gives the wire token; sqlite3 binding uses the
+    underlying str value (verified in SQL round-trip tests elsewhere)."""
+    assert PresenceState.ACTIVE == "active"
+    assert PresenceState.ACTIVE.value == "active"
+    assert QueueOutcome.ACCEPTED_BY_CLI.value == "accepted_by_cli"
+    assert Disposition.ACCEPTED.value == "accepted"
+    assert DeliveryState.PENDING.value == "pending"
+
+
+def test_disposition_includes_unevaluated_but_receipt_rejects_it():
+    """Full enum includes UNEVALUATED (matches codex-manager). Receipts reject it."""
+    assert Disposition.UNEVALUATED.value == "unevaluated"
     with pytest.raises(ValueError):
         DispositionReceipt(
-            message_id=_u(),
-            target_session_uuid=tgt_uuid,
-            target_session_incarnation_id=tgt_inc,
-            correlation_id=_u(),
-            consumer_id="c",
-            receiver_session_uuid=_u(),           # different!
-            receiver_session_incarnation_id=tgt_inc,
-            disposition="accepted",
-            observed_at=1,
-            reason="",
-            delivered_at=1,
+            message_id=_u(), correlation_id=_u(), consumer_id="c",
+            receiver_session_uuid=_u(), receiver_session_incarnation_id=_u(),
+            disposition=Disposition.UNEVALUATED, observed_at=1, reason="",
         )
 
 
-def test_enum_str_matches_wire_token():
-    """StrEnum: str(PresenceState.ACTIVE) == 'active' per §5."""
-    assert str(PresenceState.ACTIVE) == "active"
-    assert str(PresenceState.BUSY) == "busy"
-    assert str(PresenceState.IDLE) == "idle"
-    assert str(PresenceState.STOPPING) == "stopping"
-    assert str(PresenceState.STALE) == "stale"
-
-    assert str(QueueOutcome.ACCEPTED_BY_CLI) == "accepted_by_cli"
-    assert str(QueueOutcome.REJECTED) == "rejected"
-    assert str(QueueOutcome.AMBIGUOUS_TIMEOUT) == "ambiguous_timeout"
-    assert str(QueueOutcome.ADAPTER_DISABLED) == "adapter_disabled"
-
-    assert str(Disposition.ACCEPTED) == "accepted"
-    assert str(Disposition.DEFERRED) == "deferred"
-    assert str(Disposition.DECLINED) == "declined"
-    assert str(Disposition.NEEDS_USER) == "needs_user"
-
-    assert str(DeliveryState.PENDING) == "pending"
-    assert str(DeliveryState.CLAIMED) == "claimed"
-    assert str(DeliveryState.NOTIFIED) == "notified"
-    assert str(DeliveryState.AMBIGUOUS) == "ambiguous"
-    assert str(DeliveryState.BLOCKED) == "blocked"
-    assert str(DeliveryState.OBSERVED) == "observed"
-    assert str(DeliveryState.UNDELIVERABLE) == "undeliverable"
+def test_capability_decision_reason_tokens():
+    """Codex-aligned reason tokens: accepted / invalid_contract / revoked /
+    expired / identity_mismatch / invalid_bearer."""
+    for reason in ("accepted", "invalid_contract", "revoked", "expired",
+                   "identity_mismatch", "invalid_bearer"):
+        decision = CapabilityDecision(allowed=(reason == "accepted"), reason=reason)
+        assert decision.reason == reason
 
 
-def test_disposition_lacks_unevaluated_as_enum_member():
-    """'unevaluated' is deliberately NOT in Disposition enum."""
-    assert "UNEVALUATED" not in {m.name for m in Disposition}
-    assert "unevaluated" not in {str(m) for m in Disposition}
+def test_queue_capability_shape():
+    """Codex-aligned shape: supported, exact_version, help_sha256, reason."""
+    q = QueueCapability(
+        supported=True,
+        exact_version="codex-cli 0.149.0-alpha.4.1",
+        help_sha256="0" * 64,
+        reason="supported",
+    )
+    assert q.supported is True
+    q2 = QueueCapability(supported=False, exact_version=None, help_sha256="", reason="x")
+    assert q2.exact_version is None
+
+
+# ---- validate_notice_summary (B4 sanitizer) ----
+
+def test_summary_sanitizer_accepts_clean():
+    assert validate_notice_summary("hello world") == "hello world"
+
+
+def test_summary_sanitizer_omits_control_chars():
+    assert validate_notice_summary("bad\x01text") == SUMMARY_OMITTED
+
+
+def test_summary_sanitizer_omits_newlines():
+    assert validate_notice_summary("line1\nline2") == SUMMARY_OMITTED
+
+
+def test_summary_sanitizer_omits_markup():
+    assert validate_notice_summary("<b>hi</b>") == SUMMARY_OMITTED
+    assert validate_notice_summary("[link](url)") == SUMMARY_OMITTED
+
+
+def test_summary_sanitizer_omits_credential_labels():
+    assert validate_notice_summary("here is my password") == SUMMARY_OMITTED
+    assert validate_notice_summary("api_key=xxx") == SUMMARY_OMITTED
+    assert validate_notice_summary("Authorization: Bearer") == SUMMARY_OMITTED
+
+
+def test_summary_sanitizer_omits_oversize():
+    assert validate_notice_summary("x" * 161) == SUMMARY_OMITTED
+    assert validate_notice_summary("x" * 160) == "x" * 160
+
+
+def test_summary_sanitizer_omits_empty_or_nonstring():
+    assert validate_notice_summary("") == SUMMARY_OMITTED
+    assert validate_notice_summary(None) == SUMMARY_OMITTED

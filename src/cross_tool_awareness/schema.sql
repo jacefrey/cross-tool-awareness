@@ -1,4 +1,4 @@
--- Shared awareness schema v1
+-- Shared awareness schema v2 (v0.2.0)
 -- Design authority: machine-manager/docs/superpowers/specs/2026-10-11-shared-awareness-package-design.md v4
 -- Contract authority: codex-manager/docs/superpowers/specs/2026-10-05-codex-gate1-contracts.md (0087ebe)
 
@@ -54,7 +54,7 @@ BEGIN
     WHERE length(NEW.verifier_sha256) != 32;
 END;
 
--- 3.3 targeted_deliveries
+-- 3.3 targeted_deliveries (FK to bridge messages(id))
 CREATE TABLE IF NOT EXISTS targeted_deliveries (
     message_id                          TEXT NOT NULL,
     target_session_uuid                 TEXT NOT NULL,
@@ -71,7 +71,8 @@ CREATE TABLE IF NOT EXISTS targeted_deliveries (
     next_attempt_at                     INTEGER NOT NULL,
     expires_at                          INTEGER NOT NULL,
     last_error_class                    TEXT,
-    PRIMARY KEY (message_id, target_session_uuid, target_session_incarnation_id)
+    PRIMARY KEY (message_id, target_session_uuid, target_session_incarnation_id),
+    FOREIGN KEY (message_id) REFERENCES messages(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_delivery_eligible
@@ -177,4 +178,19 @@ CREATE TABLE IF NOT EXISTS awareness_schema_version (
     version                     INTEGER PRIMARY KEY,
     applied_at                  INTEGER NOT NULL,
     package_version             TEXT NOT NULL
+);
+
+-- 3.8 notice_claims (v0.2.0): receiver-side atomic claim slot for duplicate-safe
+-- disposition. Tracks the first observer of a notice until a receipt is
+-- durably persisted. Receipt existence is the terminal state; a stale claim
+-- past recovery_after seconds is reclaimable as 'recovered'.
+CREATE TABLE IF NOT EXISTS notice_claims (
+    message_id                          TEXT NOT NULL,
+    target_session_uuid                 TEXT NOT NULL,
+    target_session_incarnation_id       TEXT NOT NULL,
+    consumer_id                         TEXT NOT NULL,
+    correlation_id                      TEXT NOT NULL,
+    registration_fence                  TEXT NOT NULL,
+    claimed_at                          INTEGER NOT NULL,
+    PRIMARY KEY (message_id, target_session_uuid, target_session_incarnation_id)
 );

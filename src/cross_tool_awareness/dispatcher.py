@@ -1,7 +1,14 @@
 """Dispatcher state machine: run_one_iteration implementing the 7-step contract.
 
+v0.2.0 revisions:
+- Requires a notice_factory callable; placeholder WakeNotice is gone.
+- Adapter.wake exception → outcome='ambiguous_timeout' (not 'rejected').
+  The adapter may have delivered; preserve as ambiguous, no blind retry.
+
 See spec §8.
 """
+
+from __future__ import annotations
 
 import sqlite3
 import time
@@ -17,7 +24,6 @@ from .leases import (
 )
 
 
-# Fixed polling defaults; probe measures pass/fail against explicit budgets.
 POLL_INTERVAL_IDLE_SECONDS = 30
 POLL_INTERVAL_ACTIVE_SECONDS = 2
 BACKOFF_SCHEDULE_SECONDS = (0, 5, 20, 60, 300, 1800)
@@ -25,16 +31,19 @@ BACKOFF_CAP_SECONDS = 3600
 CLAIM_LEASE_TTL_SECONDS = 15
 DISPATCHER_LEASE_TTL_SECONDS = 60
 
-# Explicit budgets the foreground probe verifies.
 BUDGET_PEAK_RSS_MB = 48
 BUDGET_CPU_PCT_IDLE = 1.0
 BUDGET_WAKE_FREQ_PER_MIN_IDLE = 2
 BUDGET_SQLITE_LOCK_WAIT_MS_P95 = 50
 
 
+# Signature: notice_factory(delivery_row, registration_row) -> WakeNotice
+NoticeFactory = Callable[[sqlite3.Row, sqlite3.Row], WakeNotice]
+
+
 @dataclass
 class IterationResult:
-    status: str                             # 'lease_lost' | 'no_work' | 'pre_adapter_released' | 'finalized' | 'target_revalidation_failed' | 'adapter_unavailable'
+    status: str
     diagnostic: str = ""
     ttl_swept: int = 0
     expired_claims_recovered: int = 0
@@ -65,7 +74,6 @@ def _recover_expired_claims(db: sqlite3.Connection, *, now: int) -> int:
 
 
 def _ttl_sweep(db: sqlite3.Connection, *, now: int) -> int:
-    """Advance expired non-claimed rows to 'undeliverable'. Preserve live claims."""
     with db:
         cur = db.execute(
             "UPDATE targeted_deliveries SET delivery_state = 'undeliverable' "
@@ -97,7 +105,7 @@ def _fetch_delivery_and_target(db: sqlite3.Connection, *, message_id: str,
     return delivery, registration
 
 
-def _revalidate_target(delivery, registration, *, expected_proc_start_ns: Optional[int]) -> bool:
+def _revalidate_target(delivery, registration, *, expected_proc_start_ns):
     if registration is None:
         return False
     if registration["state"] not in ("active", "busy", "idle"):
@@ -112,30 +120,33 @@ def run_one_iteration(
     db: sqlite3.Connection,
     *,
     adapters: Mapping[str, WakeAdapter],
-    now: Callable[[], int] = lambda: int(time.time()),
     singleton_lease: SingletonDispatcherLease,
+    notice_factory: NoticeFactory,
+    now: Callable[[], int] = lambda: int(time.time()),
     expected_proc_start_ns: Optional[int] = None,
 ) -> IterationResult:
-    """Run one dispatcher iteration. Returns metrics; does not raise on normal fail-closed paths."""
+    """Run one dispatcher iteration.
+
+    notice_factory is REQUIRED (v0.2.0). The dispatcher refuses to run without
+    one; placeholder WakeNotice metadata is no longer acceptable per spec §4
+    (no placeholder channel/sender_alias; summary pipes through sanitizer).
+    """
+    if not callable(notice_factory):
+        raise TypeError("notice_factory is required (callable); placeholder notice removed in v0.2.0")
+
     now_s = now()
 
-    # Step 1: refresh singleton lease.
     if not singleton_lease.refresh(now=now_s, lease_ttl_seconds=DISPATCHER_LEASE_TTL_SECONDS):
         return IterationResult(status="lease_lost")
 
-    # Step 2: recover expired claimed leases.
     recovered = _recover_expired_claims(db, now=now_s)
-
-    # Step 3: TTL sweep (BEFORE no_work return). Preserves live 'claimed'.
     swept = _ttl_sweep(db, now=now_s)
 
-    # Step 4: claim one eligible delivery.
     claim = claim_delivery(db, now=now_s, lease_ttl_seconds=CLAIM_LEASE_TTL_SECONDS)
     if claim is None:
         return IterationResult(status="no_work", ttl_swept=swept,
                                expired_claims_recovered=recovered)
 
-    # Step 5: revalidate target.
     delivery, registration = _fetch_delivery_and_target(
         db, message_id=claim.message_id,
         target_uuid=claim.target_session_uuid,
@@ -163,7 +174,6 @@ def run_one_iteration(
             ttl_swept=swept, expired_claims_recovered=recovered,
         )
 
-    # Step 6: resolve adapter.
     wake_capability = registration["wake_capability"]
     adapter = adapters.get(wake_capability)
     if adapter is None:
@@ -193,17 +203,13 @@ def run_one_iteration(
             ttl_swept=swept, expired_claims_recovered=recovered,
         )
 
-    # Step 7: call adapter outside the SQLite transaction.
-    # Construct a minimal notice. Summary comes from the bridge messages table
-    # externally; here we use a fixed template because the dispatcher does not
-    # read message bodies (contract: "The dispatcher does not log or interpret
-    # message bodies.").
-    notice = WakeNotice(
-        message_id=claim.message_id,
-        channel="(resolved-by-caller)",
-        sender_alias_at_send="(resolved-by-caller)",
-        summary="",
-    )
+    # Caller-supplied notice factory. Resolves channel + sender_alias + summary
+    # from the delivery + registration rows (and, in production, the bridge
+    # message row). Dispatcher does not read message bodies itself.
+    notice = notice_factory(delivery, registration)
+    if not isinstance(notice, WakeNotice):
+        raise TypeError("notice_factory must return a WakeNotice")
+
     attempted_at = now_s
     try:
         outcome = adapter.wake(
@@ -212,19 +218,21 @@ def run_one_iteration(
             notice,
         )
     except Exception as exc:
-        # Adapter raised unexpectedly: treat as rejected with a bounded reason.
+        # Adapter raised. Delivery MAY have happened — preserve as ambiguous
+        # per codex-manager v0.2.0 blocker #7. No blind retry.
         reason = f"adapter_exception: {type(exc).__name__}"[:240]
-        outcome = "rejected"
+        outcome = "ambiguous_timeout"
+        finalize_reason = reason
     else:
-        reason = ""
+        if outcome == "accepted_by_cli":
+            finalize_reason = ""
+        else:
+            finalize_reason = outcome
 
-    # Step 8: finalize.
     finished_at = now()
     if outcome == "accepted_by_cli":
-        finalize_reason = ""
-        next_at = finished_at   # unused; awaits receipt or TTL
+        next_at = finished_at
     else:
-        finalize_reason = reason or outcome
         next_at = finished_at + _compute_backoff(delivery["attempt_count"] + 1)
 
     result = finalize_attempt(
