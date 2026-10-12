@@ -1,29 +1,54 @@
-"""Storage APIs for Codex-adapter consumption (v0.2.0).
+"""Storage APIs for Codex-adapter consumption (v0.3.0).
 
 Implements codex-manager's ReceiptStorage Protocol (receiver_receipts.py) and
 adds fenced apply_registration_update + atomic authenticated targeted-send.
 Nothing in this module writes to the live bridge DB — the caller passes an
 sqlite3.Connection scoped to a tmpdir fixture DB or (in future) the shared
 bridge DB after separate authorization.
+
+v0.3.0 fixes (from codex-manager seq=195 review):
+
+- B1 is now atomic. ``create_authenticated_targeted_send`` requires a
+  ``message_writer`` callable, which runs *inside* the same BEGIN EXCLUSIVE
+  transaction as the targeted_deliveries insert. The caller supplies the real
+  bridge-side INSERT (payload column + whatever the live bridge schema
+  requires); the stub test fixture supplies its own. There is no silent
+  payload discard anymore — the writer either runs atomically or the whole
+  send fails.
+- B2 BEGIN EXCLUSIVE is now real. Every method here that does a
+  SELECT-then-INSERT or needs serialization uses ``_txn.exclusive`` (explicit
+  BEGIN EXCLUSIVE, explicit COMMIT/ROLLBACK) instead of Python's DEFERRED
+  ``with db:``.
+- B3 ``claim_notice`` and ``record_first_disposition`` additionally recover
+  from sqlite3.IntegrityError (defense-in-depth: even if a caller somehow runs
+  without EXCLUSIVE serialization — e.g. by passing a WAL-mode connection that
+  does not block — the duplicate-key race resolves deterministically by
+  re-selecting the durable state).
 """
 
 from __future__ import annotations
 
-import hashlib
 import sqlite3
 from dataclasses import dataclass
-from typing import Optional, Protocol
-from uuid import UUID, uuid4
+from typing import Callable, Optional
+from uuid import uuid4
 
+from ._txn import exclusive
 from .capability import verify_capability
 from .contracts import (
-    CapabilityDecision,
     DispositionReceipt,
     NoticeClaim,
     NoticeKey,
     NoticeObservation,
     RegistrationUpdate,
 )
+
+
+# Signature of the message_writer callable supplied by the caller.
+# Called with (db, message_id, message_payload, now).
+# Must INSERT the message row into whatever table the caller's bridge uses.
+# Runs inside the same BEGIN EXCLUSIVE transaction as the delivery insert.
+MessageWriter = Callable[[sqlite3.Connection, str, str, int], None]
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +84,7 @@ class ReceiptStorage:
             raise ValueError("recovery_after must be a positive int")
 
         key = notice.key
-        with self._db:
+        with exclusive(self._db):
             # Terminal observed state wins.
             existing_receipt = self._db.execute(
                 "SELECT * FROM disposition_receipts "
@@ -86,7 +111,6 @@ class ReceiptStorage:
                 claim_age = now - existing_claim["claimed_at"]
                 if claim_age < recovery_after:
                     return NoticeClaim(status="duplicate")
-                # Stale — upsert.
                 self._db.execute(
                     "UPDATE notice_claims "
                     "SET consumer_id = ?, correlation_id = ?, "
@@ -101,19 +125,34 @@ class ReceiptStorage:
                 )
                 return NoticeClaim(status="recovered")
 
-            # No prior claim — insert.
-            self._db.execute(
-                "INSERT INTO notice_claims "
-                "(message_id, target_session_uuid, target_session_incarnation_id, "
-                " consumer_id, correlation_id, registration_fence, claimed_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (str(key.message_id),
-                 str(key.target_session_uuid),
-                 str(key.target_session_incarnation_id),
-                 notice.consumer_id, str(notice.correlation_id),
-                 notice.registration_fence, now),
-            )
-            return NoticeClaim(status="first")
+            try:
+                self._db.execute(
+                    "INSERT INTO notice_claims "
+                    "(message_id, target_session_uuid, target_session_incarnation_id, "
+                    " consumer_id, correlation_id, registration_fence, claimed_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (str(key.message_id),
+                     str(key.target_session_uuid),
+                     str(key.target_session_incarnation_id),
+                     notice.consumer_id, str(notice.correlation_id),
+                     notice.registration_fence, now),
+                )
+                return NoticeClaim(status="first")
+            except sqlite3.IntegrityError:
+                # Defense in depth: a concurrent writer inserted between our
+                # SELECT and INSERT despite EXCLUSIVE. Re-check durable state.
+                receipt_row = self._db.execute(
+                    "SELECT * FROM disposition_receipts "
+                    "WHERE message_id = ? AND target_session_uuid = ? "
+                    "  AND target_session_incarnation_id = ?",
+                    (str(key.message_id),
+                     str(key.target_session_uuid),
+                     str(key.target_session_incarnation_id)),
+                ).fetchone()
+                if receipt_row is not None:
+                    return NoticeClaim(status="observed",
+                                       receipt=_row_to_receipt(receipt_row))
+                return NoticeClaim(status="duplicate")
 
     def record_first_disposition(
         self,
@@ -132,7 +171,7 @@ class ReceiptStorage:
         if receipt.receiver_session_incarnation_id != key.target_session_incarnation_id:
             raise ValueError("receipt.receiver_session_incarnation_id does not match key")
 
-        with self._db:
+        with exclusive(self._db):
             existing = self._db.execute(
                 "SELECT * FROM disposition_receipts "
                 "WHERE message_id = ? AND target_session_uuid = ? "
@@ -164,11 +203,8 @@ class ReceiptStorage:
                      receipt.observed_at),
                 )
                 return receipt
-            except sqlite3.IntegrityError as exc:
-                # Rare race: concurrent write landed between SELECT and INSERT.
-                # Re-SELECT; if truly present, return it; otherwise re-raise
-                # (could be a different integrity failure, e.g., ineligible
-                # delivery state at the time of INSERT).
+            except sqlite3.IntegrityError:
+                # Defense in depth under non-EXCLUSIVE connections.
                 existing = self._db.execute(
                     "SELECT * FROM disposition_receipts "
                     "WHERE message_id = ? AND target_session_uuid = ? "
@@ -178,6 +214,8 @@ class ReceiptStorage:
                      str(key.target_session_incarnation_id)),
                 ).fetchone()
                 if existing is None:
+                    # Not a duplicate — some other integrity failure
+                    # (e.g. the eligible-delivery-state trigger).
                     raise
                 return _row_to_receipt(existing)
 
@@ -221,7 +259,7 @@ def apply_registration_update(
         raise ValueError("update must be a RegistrationUpdate")
     db.row_factory = sqlite3.Row
 
-    with db:
+    with exclusive(db):
         row = db.execute(
             "SELECT * FROM session_registrations "
             "WHERE session_uuid = ? AND session_incarnation_id = ?",
@@ -266,6 +304,7 @@ def create_authenticated_targeted_send(
     db: sqlite3.Connection,
     *,
     message_payload: str,
+    message_writer: MessageWriter,
     sender_cap_bearer: bytes,
     sender_session_uuid,
     sender_session_incarnation_id,
@@ -277,15 +316,26 @@ def create_authenticated_targeted_send(
     expires_at: int,
     message_id: Optional[object] = None,
 ) -> TargetedSendResult:
-    """Verify sender capability, then atomically insert bridge message +
+    """Verify sender capability, then atomically persist bridge message +
     targeted_deliveries row inside one BEGIN EXCLUSIVE.
 
-    Refuses on verify failure or if the exact target incarnation is not live.
+    The caller supplies ``message_writer`` — a callable that takes
+    (db, message_id, message_payload, now) and inserts the bridge message
+    row (payload + whatever other columns the live bridge schema requires).
+    The writer runs inside the same EXCLUSIVE transaction as the delivery
+    insert, so bridge message and delivery row are atomic together.
+
+    The writer MUST raise sqlite3.IntegrityError if the message_id already
+    exists (UNIQUE constraint on messages(id)); this path returns
+    ``rejected_message_exists``. Any other IntegrityError is re-raised.
     """
+    if message_writer is None or not callable(message_writer):
+        raise ValueError("message_writer is required and must be callable")
+
     db.row_factory = sqlite3.Row
     msg_id = str(message_id) if message_id is not None else str(uuid4())
 
-    with db:
+    with exclusive(db):
         decision = verify_capability(
             db, sender_cap_bearer,
             expected_sender_uuid=sender_session_uuid,
@@ -310,12 +360,10 @@ def create_authenticated_targeted_send(
                                       reason=f"state={target['state']}")
 
         try:
-            db.execute(
-                "INSERT INTO messages (id, created_at) VALUES (?, ?)",
-                (msg_id, now),
-            )
+            message_writer(db, msg_id, message_payload, now)
         except sqlite3.IntegrityError as exc:
-            if "UNIQUE" in str(exc) or "PRIMARY KEY" in str(exc):
+            err = str(exc)
+            if "UNIQUE" in err or "PRIMARY KEY" in err:
                 return TargetedSendResult(status="rejected_message_exists",
                                           message_id=msg_id)
             raise
@@ -331,11 +379,5 @@ def create_authenticated_targeted_send(
              str(sender_session_uuid), str(sender_session_incarnation_id),
              now, now, expires_at),
         )
-        # NOTE: message_payload would be routed to the bridge's payload column
-        # here in production; the stub `messages` table used by tests has only
-        # (id, created_at), so payload is intentionally not inserted. Live
-        # bridge DB has its own payload column + API that the sender should
-        # go through separately. Documented in CHANGELOG.
-        _ = message_payload
 
         return TargetedSendResult(status="sent", message_id=msg_id)

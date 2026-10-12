@@ -19,7 +19,7 @@ design_spec = "machine-manager/docs/superpowers/specs/2026-10-11-shared-awarenes
 contracts_source = "codex-manager/docs/superpowers/specs/2026-10-05-codex-gate1-contracts.md"
 contracts_source_commit = "0087ebe"
 
-package_version = "0.2.0"
-package_sha256 = "76332eb234f403b30c7cd7d97a3f514422b68781f8e0aa8930c1fada0b312bf6"
+package_version = "0.3.0"
+package_sha256 = "c00f43701c454ad181bec1ceb865328a3773f96bbd36b43d7657c6e0e2661ebc"
 
 changelog_heading = "Changelog"

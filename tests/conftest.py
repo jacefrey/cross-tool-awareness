@@ -22,9 +22,23 @@ from cross_tool_awareness.contracts import PresenceRecord  # noqa: E402
 _STUB_MESSAGES_DDL = """
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
+    payload TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL DEFAULT 0
 );
 """
+
+
+def stub_message_writer(conn, message_id, payload, now):
+    """Reference message_writer for ``create_authenticated_targeted_send``.
+
+    Inserts the stub ``messages`` row (id, payload, created_at). Raises
+    sqlite3.IntegrityError on duplicate id — the storage API catches that
+    and returns rejected_message_exists.
+    """
+    conn.execute(
+        "INSERT INTO messages (id, payload, created_at) VALUES (?, ?, ?)",
+        (message_id, payload, now),
+    )
 
 
 def _schema_sql() -> str:
@@ -89,6 +103,12 @@ def make_presence_fn():
 
 def insert_message(db: sqlite3.Connection, message_id: str) -> None:
     db.execute("INSERT OR IGNORE INTO messages (id) VALUES (?)", (message_id,))
+
+
+@pytest.fixture
+def message_writer():
+    """Fixture returning the reference stub_message_writer."""
+    return stub_message_writer
 
 
 @pytest.fixture

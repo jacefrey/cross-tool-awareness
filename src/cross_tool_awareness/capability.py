@@ -1,8 +1,9 @@
 """Sender capability lifecycle: BearerCapability wrapper + issue/verify/rotate/revoke.
 
-Transaction-neutral helpers (v0.2.0): issue/verify/revoke do NOT open their own
+Transaction-neutral helpers (v0.3.0): issue/verify/revoke do NOT open their own
 transactions. The caller owns transaction scope. rotate_capability opens one
-BEGIN EXCLUSIVE and calls the helpers inside it so revoke+issue are atomic.
+explicit BEGIN EXCLUSIVE (via ``_txn.exclusive``) and calls the helpers inside
+it so revoke+issue are atomic — a failure in issue rolls back the revoke.
 
 The 32-byte bearer never crosses the storage boundary. Only the SHA-256 verifier
 is persisted.
@@ -18,6 +19,7 @@ import hmac
 import sqlite3
 from typing import Callable
 
+from ._txn import exclusive
 from .contracts import CapabilityDecision
 
 
@@ -184,10 +186,11 @@ def rotate_capability(
 ) -> BearerCapability:
     """Atomic rotation: validate old, revoke old, issue new — all in one txn.
 
-    Uses one BEGIN EXCLUSIVE wrapping transaction-neutral helpers. If
-    issue_capability raises mid-flight, the revoke is rolled back (atomicity).
+    Uses one explicit BEGIN EXCLUSIVE (via ``_txn.exclusive``) wrapping
+    transaction-neutral helpers. If issue_capability raises mid-flight, the
+    revoke is rolled back (atomicity).
     """
-    with db:  # one outer transaction
+    with exclusive(db):
         decision = verify_capability(
             db, old_bearer,
             expected_sender_uuid=expected_sender_uuid,

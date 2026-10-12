@@ -294,7 +294,7 @@ def test_apply_registration_update_rejects_stale_observation(db, make_presence_f
 # ---------------------------------------------------------------------------
 
 
-def test_authenticated_targeted_send_sent(db, make_presence_fn):
+def test_authenticated_targeted_send_sent(db, make_presence_fn, message_writer):
     sender = make_presence_fn()
     target = make_presence_fn()
     register_session(db, sender, now=1_000_000)
@@ -308,6 +308,7 @@ def test_authenticated_targeted_send_sent(db, make_presence_fn):
     result = create_authenticated_targeted_send(
         db,
         message_payload="hello",
+        message_writer=message_writer,
         sender_cap_bearer=cap.present(),
         sender_session_uuid=sender.session_uuid,
         sender_session_incarnation_id=sender.session_incarnation_id,
@@ -326,13 +327,84 @@ def test_authenticated_targeted_send_sent(db, make_presence_fn):
     ).fetchone()
     assert row["delivery_state"] == "pending"
     msg_row = db.execute(
-        "SELECT id FROM messages WHERE id=?",
+        "SELECT id, payload, created_at FROM messages WHERE id=?",
         (result.message_id,),
     ).fetchone()
     assert msg_row is not None
+    assert msg_row["payload"] == "hello"
+    assert msg_row["created_at"] == 1_000_020
 
 
-def test_authenticated_targeted_send_rejects_invalid_bearer(db, make_presence_fn):
+def test_authenticated_targeted_send_requires_message_writer(db, make_presence_fn):
+    sender = make_presence_fn()
+    target = make_presence_fn()
+    register_session(db, sender, now=1_000_000)
+    register_session(db, target, now=1_000_000)
+    cap = issue_capability(
+        db, session_uuid=sender.session_uuid,
+        session_incarnation_id=sender.session_incarnation_id,
+        now=1_000_010,
+        entropy_source=_fixed_entropy(b"\x0f"),
+    )
+    import pytest
+    with pytest.raises(ValueError, match="message_writer"):
+        create_authenticated_targeted_send(
+            db,
+            message_payload="hello",
+            message_writer=None,
+            sender_cap_bearer=cap.present(),
+            sender_session_uuid=sender.session_uuid,
+            sender_session_incarnation_id=sender.session_incarnation_id,
+            sender_registration_fence=sender.registration_fence,
+            target_session_uuid=target.session_uuid,
+            target_session_incarnation_id=target.session_incarnation_id,
+            correlation_id=_uuid.uuid4(),
+            now=1_000_020,
+            expires_at=1_000_020 + 3600,
+        )
+
+
+def test_authenticated_targeted_send_message_writer_failure_rolls_back(db, make_presence_fn):
+    sender = make_presence_fn()
+    target = make_presence_fn()
+    register_session(db, sender, now=1_000_000)
+    register_session(db, target, now=1_000_000)
+    cap = issue_capability(
+        db, session_uuid=sender.session_uuid,
+        session_incarnation_id=sender.session_incarnation_id,
+        now=1_000_010,
+        entropy_source=_fixed_entropy(b"\x0e"),
+    )
+
+    class _WriterBoom(RuntimeError):
+        pass
+
+    def _boom(_conn, _mid, _payload, _now):
+        raise _WriterBoom("writer failed")
+
+    import pytest
+    with pytest.raises(_WriterBoom):
+        create_authenticated_targeted_send(
+            db,
+            message_payload="x",
+            message_writer=_boom,
+            sender_cap_bearer=cap.present(),
+            sender_session_uuid=sender.session_uuid,
+            sender_session_incarnation_id=sender.session_incarnation_id,
+            sender_registration_fence=sender.registration_fence,
+            target_session_uuid=target.session_uuid,
+            target_session_incarnation_id=target.session_incarnation_id,
+            correlation_id=_uuid.uuid4(),
+            now=1_000_020,
+            expires_at=1_000_020 + 3600,
+        )
+    # Writer raised → whole BEGIN EXCLUSIVE must roll back; no message row
+    # and no delivery row persisted.
+    assert db.execute("SELECT COUNT(*) AS c FROM messages").fetchone()["c"] == 0
+    assert db.execute("SELECT COUNT(*) AS c FROM targeted_deliveries").fetchone()["c"] == 0
+
+
+def test_authenticated_targeted_send_rejects_invalid_bearer(db, make_presence_fn, message_writer):
     sender = make_presence_fn()
     target = make_presence_fn()
     register_session(db, sender, now=1_000_000)
@@ -340,6 +412,7 @@ def test_authenticated_targeted_send_rejects_invalid_bearer(db, make_presence_fn
     result = create_authenticated_targeted_send(
         db,
         message_payload="hello",
+        message_writer=message_writer,
         sender_cap_bearer=b"\x00" * 32,  # not a real capability
         sender_session_uuid=sender.session_uuid,
         sender_session_incarnation_id=sender.session_incarnation_id,
@@ -355,7 +428,7 @@ def test_authenticated_targeted_send_rejects_invalid_bearer(db, make_presence_fn
     assert cnt["c"] == 0
 
 
-def test_authenticated_targeted_send_rejects_revoked_target(db, make_presence_fn):
+def test_authenticated_targeted_send_rejects_revoked_target(db, make_presence_fn, message_writer):
     sender = make_presence_fn()
     target = make_presence_fn()
     register_session(db, sender, now=1_000_000)
@@ -373,6 +446,7 @@ def test_authenticated_targeted_send_rejects_revoked_target(db, make_presence_fn
     result = create_authenticated_targeted_send(
         db,
         message_payload="hello",
+        message_writer=message_writer,
         sender_cap_bearer=cap.present(),
         sender_session_uuid=sender.session_uuid,
         sender_session_incarnation_id=sender.session_incarnation_id,
@@ -388,7 +462,7 @@ def test_authenticated_targeted_send_rejects_revoked_target(db, make_presence_fn
     assert cnt["c"] == 0
 
 
-def test_authenticated_targeted_send_rejects_duplicate_message_id(db, make_presence_fn):
+def test_authenticated_targeted_send_rejects_duplicate_message_id(db, make_presence_fn, message_writer):
     sender = make_presence_fn()
     target = make_presence_fn()
     register_session(db, sender, now=1_000_000)
@@ -401,7 +475,8 @@ def test_authenticated_targeted_send_rejects_duplicate_message_id(db, make_prese
     )
     fixed_id = str(_uuid.uuid4())
     r1 = create_authenticated_targeted_send(
-        db, message_payload="first", sender_cap_bearer=cap.present(),
+        db, message_payload="first", message_writer=message_writer,
+        sender_cap_bearer=cap.present(),
         sender_session_uuid=sender.session_uuid,
         sender_session_incarnation_id=sender.session_incarnation_id,
         sender_registration_fence=sender.registration_fence,
@@ -413,7 +488,8 @@ def test_authenticated_targeted_send_rejects_duplicate_message_id(db, make_prese
     )
     assert r1.status == "sent"
     r2 = create_authenticated_targeted_send(
-        db, message_payload="second", sender_cap_bearer=cap.present(),
+        db, message_payload="second", message_writer=message_writer,
+        sender_cap_bearer=cap.present(),
         sender_session_uuid=sender.session_uuid,
         sender_session_incarnation_id=sender.session_incarnation_id,
         sender_registration_fence=sender.registration_fence,
