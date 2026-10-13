@@ -95,6 +95,17 @@ class ClaimedDelivery:
 
 
 @dataclass(frozen=True)
+class StuckDispatching:
+    """A delivery whose bounded adapter call has not reached finalization."""
+
+    message_id: UUID
+    target_session_uuid: UUID
+    target_session_incarnation_id: UUID
+    dispatch_started_at: int
+    claim_lease_token: str
+
+
+@dataclass(frozen=True)
 class PreAdapterReleaseResult:
     status: str                    # 'released' | 'lease_released_or_observed'
     diagnostic: Optional[str] = None
@@ -196,6 +207,49 @@ def pre_adapter_mark(
             ),
         )
         return cursor.rowcount == 1
+
+
+def list_stuck_dispatching(
+    db: sqlite3.Connection,
+    now: int,
+    *,
+    stale_after_seconds: int,
+) -> list[StuckDispatching]:
+    """Return old ``dispatching`` rows without mutating or recovering them.
+
+    A row whose age is exactly ``stale_after_seconds`` is included.  This is
+    an inspection surface only: elapsed time never makes a dispatching row
+    eligible for automatic retry.
+    """
+    if (
+        isinstance(stale_after_seconds, bool)
+        or not isinstance(stale_after_seconds, int)
+        or stale_after_seconds < 0
+    ):
+        raise ValueError("stale_after_seconds must be a nonnegative int")
+    db.row_factory = sqlite3.Row
+    rows = db.execute(
+        "SELECT message_id, target_session_uuid, "
+        "       target_session_incarnation_id, dispatch_started_at, "
+        "       claim_lease_token "
+        "FROM targeted_deliveries "
+        "WHERE delivery_state = 'dispatching' "
+        "  AND (? - dispatch_started_at) >= ? "
+        "ORDER BY dispatch_started_at ASC, message_id ASC",
+        (int(now), stale_after_seconds),
+    ).fetchall()
+    return [
+        StuckDispatching(
+            message_id=UUID(row["message_id"]),
+            target_session_uuid=UUID(row["target_session_uuid"]),
+            target_session_incarnation_id=UUID(
+                row["target_session_incarnation_id"]
+            ),
+            dispatch_started_at=row["dispatch_started_at"],
+            claim_lease_token=row["claim_lease_token"],
+        )
+        for row in rows
+    ]
 
 
 def pre_adapter_release(

@@ -53,8 +53,10 @@ from .leases import (
     FinalizationResult,
     PreAdapterReleaseResult,
     SingletonDispatcherLease,
+    StuckDispatching,
     claim_delivery,
     finalize_attempt,
+    list_stuck_dispatching,
     pre_adapter_mark,
     pre_adapter_release,
 )
@@ -107,8 +109,9 @@ __all__ = [
     "run_one_iteration",
     # leases
     "ClaimedDelivery", "FinalizationResult", "PreAdapterReleaseResult",
-    "SingletonDispatcherLease", "claim_delivery", "finalize_attempt",
-    "pre_adapter_mark", "pre_adapter_release",
+    "SingletonDispatcherLease", "StuckDispatching", "claim_delivery",
+    "finalize_attempt", "list_stuck_dispatching", "pre_adapter_mark",
+    "pre_adapter_release",
     # location
     "DEFAULT_BRIDGE_DB_PATH", "resolve_bridge_db_path",
     # migrations
