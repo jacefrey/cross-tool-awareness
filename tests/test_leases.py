@@ -1,8 +1,10 @@
 """Lease tests (§12.4)."""
 
+import inspect
 import uuid as _uuid
 
 import pytest
+import cross_tool_awareness as awareness
 
 from cross_tool_awareness import (
     SingletonDispatcherLease,
@@ -21,6 +23,12 @@ def register_session(db, presence, *, now):
         holder_pid=12_345,
         process_started_at=presence.started_at,
     )
+
+
+def pre_adapter_mark(*args, **kwargs):
+    implementation = getattr(awareness, "pre_adapter_mark", None)
+    assert implementation is not None, "pre_adapter_mark must be exported"
+    return implementation(*args, **kwargs)
 
 
 def _u() -> str:
@@ -194,3 +202,220 @@ def test_pre_adapter_release_rejects_invalid_next_state(db):
             db, claim_lease_token="x",
             next_state="notified", diagnostic="d", next_attempt_at=0,
         )
+
+
+# ---------------------------------------------------------------------------
+# v0.4 C4: pre-adapter mark + expired-claim recovery
+# ---------------------------------------------------------------------------
+
+def _claimed_delivery(db, make_presence_fn, msg, *, lease_ttl_seconds=15):
+    presence = make_presence_fn()
+    register_session(db, presence, now=1_000_000)
+    message_id = msg()
+    _insert_delivery(
+        db,
+        message_id=message_id,
+        target_uuid=presence.session_uuid,
+        target_incarnation=presence.session_incarnation_id,
+    )
+    claim = claim_delivery(
+        db, now=1_000_100, lease_ttl_seconds=lease_ttl_seconds
+    )
+    assert claim is not None
+    return claim
+
+
+def test_pre_adapter_mark_transitions_exact_owned_claim(
+    db, make_presence_fn, msg
+):
+    signature = inspect.signature(awareness.pre_adapter_mark)
+    assert [
+        signature.parameters[name].annotation
+        for name in (
+            "message_id",
+            "target_session_uuid",
+            "target_session_incarnation_id",
+        )
+    ] == ["UUID", "UUID", "UUID"]
+    assert signature.return_annotation == "bool"
+    claim = _claimed_delivery(db, make_presence_fn, msg)
+
+    assert pre_adapter_mark(
+        db,
+        message_id=claim.message_id,
+        target_session_uuid=claim.target_session_uuid,
+        target_session_incarnation_id=claim.target_session_incarnation_id,
+        lease_token=claim.claim_lease_token,
+        now=1_000_105,
+    )
+
+    row = db.execute(
+        "SELECT delivery_state, dispatch_started_at, claim_lease_token "
+        "FROM targeted_deliveries WHERE message_id = ?",
+        (claim.message_id,),
+    ).fetchone()
+    assert dict(row) == {
+        "delivery_state": "dispatching",
+        "dispatch_started_at": 1_000_105,
+        "claim_lease_token": claim.claim_lease_token,
+    }
+
+
+def test_pre_adapter_mark_rejects_missing_wrong_token_and_repeat(
+    db, make_presence_fn, msg
+):
+    claim = _claimed_delivery(db, make_presence_fn, msg)
+    common = dict(
+        target_session_uuid=claim.target_session_uuid,
+        target_session_incarnation_id=claim.target_session_incarnation_id,
+        now=1_000_105,
+    )
+    assert not pre_adapter_mark(
+        db,
+        message_id=str(_uuid.uuid4()),
+        lease_token=claim.claim_lease_token,
+        **common,
+    )
+    assert not pre_adapter_mark(
+        db,
+        message_id=claim.message_id,
+        lease_token="wrong-token",
+        **common,
+    )
+    assert pre_adapter_mark(
+        db,
+        message_id=claim.message_id,
+        lease_token=claim.claim_lease_token,
+        **common,
+    )
+    assert not pre_adapter_mark(
+        db,
+        message_id=claim.message_id,
+        lease_token=claim.claim_lease_token,
+        **common,
+    )
+
+
+def test_pre_adapter_mark_failure_leaves_claim_releasable(
+    db, make_presence_fn, msg
+):
+    claim = _claimed_delivery(db, make_presence_fn, msg)
+    db.execute(
+        "CREATE TRIGGER fail_dispatch_mark BEFORE UPDATE ON targeted_deliveries "
+        "WHEN NEW.delivery_state = 'dispatching' "
+        "BEGIN SELECT RAISE(ABORT, 'forced mark failure'); END"
+    )
+
+    with pytest.raises(Exception, match="forced mark failure"):
+        pre_adapter_mark(
+            db,
+            message_id=claim.message_id,
+            target_session_uuid=claim.target_session_uuid,
+            target_session_incarnation_id=claim.target_session_incarnation_id,
+            lease_token=claim.claim_lease_token,
+            now=1_000_105,
+        )
+
+    db.execute("DROP TRIGGER fail_dispatch_mark")
+    result = pre_adapter_release(
+        db,
+        claim_lease_token=claim.claim_lease_token,
+        next_state="pending",
+        diagnostic="pre_adapter_mark_error",
+        next_attempt_at=1_000_200,
+    )
+    assert result.status == "released"
+
+
+def test_claim_delivery_recovers_expired_claim_with_new_fence(
+    db, make_presence_fn, msg
+):
+    original = _claimed_delivery(
+        db, make_presence_fn, msg, lease_ttl_seconds=5
+    )
+
+    recovered = claim_delivery(db, now=1_000_106, lease_ttl_seconds=20)
+
+    assert recovered is not None
+    assert recovered.message_id == original.message_id
+    assert recovered.claim_lease_token != original.claim_lease_token
+    row = db.execute(
+        "SELECT delivery_state, claim_lease_token, claim_lease_expires_at "
+        "FROM targeted_deliveries WHERE message_id = ?",
+        (original.message_id,),
+    ).fetchone()
+    assert dict(row) == {
+        "delivery_state": "claimed",
+        "claim_lease_token": recovered.claim_lease_token,
+        "claim_lease_expires_at": 1_000_126,
+    }
+    stale_release = pre_adapter_release(
+        db,
+        claim_lease_token=original.claim_lease_token,
+        next_state="pending",
+        diagnostic="stale-worker",
+        next_attempt_at=1_000_200,
+    )
+    assert stale_release.status == "lease_released_or_observed"
+    stale_finalize = finalize_attempt(
+        db,
+        claim_lease_token=original.claim_lease_token,
+        message_id=original.message_id,
+        target_session_uuid=original.target_session_uuid,
+        target_session_incarnation_id=original.target_session_incarnation_id,
+        outcome="rejected",
+        reason="stale worker",
+        attempted_at=1_000_106,
+        now=1_000_107,
+        next_attempt_at=1_000_200,
+    )
+    assert stale_finalize.status == "lease_already_released"
+    current = db.execute(
+        "SELECT delivery_state, claim_lease_token FROM targeted_deliveries "
+        "WHERE message_id = ?",
+        (original.message_id,),
+    ).fetchone()
+    assert dict(current) == {
+        "delivery_state": "claimed",
+        "claim_lease_token": recovered.claim_lease_token,
+    }
+
+
+def test_claim_delivery_does_not_recover_unexpired_claim(
+    db, make_presence_fn, msg
+):
+    _claimed_delivery(db, make_presence_fn, msg, lease_ttl_seconds=20)
+    assert claim_delivery(db, now=1_000_119) is None
+
+
+def test_claim_delivery_never_recovers_dispatching_row(
+    db, make_presence_fn, msg
+):
+    claim = _claimed_delivery(db, make_presence_fn, msg, lease_ttl_seconds=5)
+    assert pre_adapter_mark(
+        db,
+        message_id=claim.message_id,
+        target_session_uuid=claim.target_session_uuid,
+        target_session_incarnation_id=claim.target_session_incarnation_id,
+        lease_token=claim.claim_lease_token,
+        now=1_000_101,
+    )
+    assert claim_delivery(db, now=9_000_000) is None
+
+    release = pre_adapter_release(
+        db,
+        claim_lease_token=claim.claim_lease_token,
+        next_state="pending",
+        diagnostic="late-release",
+        next_attempt_at=9_000_001,
+    )
+    assert release.status == "lease_released_or_observed"
+    row = db.execute(
+        "SELECT delivery_state, claim_lease_token FROM targeted_deliveries "
+        "WHERE message_id = ?",
+        (claim.message_id,),
+    ).fetchone()
+    assert dict(row) == {
+        "delivery_state": "dispatching",
+        "claim_lease_token": claim.claim_lease_token,
+    }

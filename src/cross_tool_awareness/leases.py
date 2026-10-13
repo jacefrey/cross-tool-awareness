@@ -4,10 +4,13 @@ fenced idempotent finalization, and pre-adapter release.
 See spec §7.
 """
 
+from __future__ import annotations
+
 import secrets
 import sqlite3
 from dataclasses import dataclass
 from typing import Optional
+from uuid import UUID
 
 
 # ---------------------------------------------------------------------------
@@ -118,16 +121,23 @@ def claim_delivery(
     now: int,
     lease_ttl_seconds: int = 15,
 ) -> Optional[ClaimedDelivery]:
-    """Atomically select ONE pending eligible delivery; stamp lease; advance to 'claimed'."""
+    """Claim one due pending row or recover one expired claimed row.
+
+    ``dispatching`` rows are never eligible, regardless of age.
+    """
     token = secrets.token_hex(16)
     with db:
         db.row_factory = sqlite3.Row
         row = db.execute(
-            "SELECT message_id, target_session_uuid, target_session_incarnation_id "
+            "SELECT message_id, target_session_uuid, target_session_incarnation_id, "
+            "       delivery_state, claim_lease_token "
             "FROM targeted_deliveries "
-            "WHERE delivery_state = 'pending' AND next_attempt_at <= ? "
-            "ORDER BY next_attempt_at ASC LIMIT 1",
-            (now,),
+            "WHERE (delivery_state = 'pending' AND next_attempt_at <= ?) "
+            "   OR (delivery_state = 'claimed' AND claim_lease_expires_at <= ?) "
+            "ORDER BY CASE WHEN delivery_state = 'pending' THEN next_attempt_at "
+            "              ELSE claim_lease_expires_at END ASC "
+            "LIMIT 1",
+            (now, now),
         ).fetchone()
         if row is None:
             return None
@@ -137,10 +147,14 @@ def claim_delivery(
             "    claim_lease_expires_at = ? "
             "WHERE message_id = ? AND target_session_uuid = ? "
             "  AND target_session_incarnation_id = ? "
-            "  AND delivery_state = 'pending'",
+            "  AND ((delivery_state = 'pending') "
+            "       OR (delivery_state = 'claimed' "
+            "           AND claim_lease_token = ? "
+            "           AND claim_lease_expires_at <= ?))",
             (token, now + int(lease_ttl_seconds),
              row["message_id"], row["target_session_uuid"],
-             row["target_session_incarnation_id"]),
+             row["target_session_incarnation_id"],
+             row["claim_lease_token"], now),
         )
         if cur.rowcount == 0:
             return None
@@ -150,6 +164,38 @@ def claim_delivery(
         target_session_incarnation_id=row["target_session_incarnation_id"],
         claim_lease_token=token,
     )
+
+
+def pre_adapter_mark(
+    db: sqlite3.Connection,
+    *,
+    message_id: UUID,
+    target_session_uuid: UUID,
+    target_session_incarnation_id: UUID,
+    lease_token: str,
+    now: int,
+) -> bool:
+    """Transition the exact leased claim to ``dispatching`` at ``now``.
+
+    Returns False when the exact claim and token are no longer in the claimed
+    state. The caller must not invoke the adapter after a False result.
+    """
+    with db:
+        cursor = db.execute(
+            "UPDATE targeted_deliveries "
+            "SET delivery_state = 'dispatching', dispatch_started_at = ? "
+            "WHERE message_id = ? AND target_session_uuid = ? "
+            "  AND target_session_incarnation_id = ? "
+            "  AND delivery_state = 'claimed' AND claim_lease_token = ?",
+            (
+                int(now),
+                str(message_id),
+                str(target_session_uuid),
+                str(target_session_incarnation_id),
+                lease_token,
+            ),
+        )
+        return cursor.rowcount == 1
 
 
 def pre_adapter_release(
@@ -174,7 +220,7 @@ def pre_adapter_release(
             "    claim_lease_expires_at = NULL, next_attempt_at = ?, "
             "    last_error_class = ? "
             "WHERE claim_lease_token = ? "
-            "  AND delivery_state NOT IN ('observed', 'undeliverable')",
+            "  AND delivery_state = 'claimed'",
             (next_state, int(next_attempt_at), diagnostic, claim_lease_token),
         )
         if cur.rowcount == 0:

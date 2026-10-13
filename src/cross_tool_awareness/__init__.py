@@ -55,6 +55,7 @@ from .leases import (
     SingletonDispatcherLease,
     claim_delivery,
     finalize_attempt,
+    pre_adapter_mark,
     pre_adapter_release,
 )
 from .location import DEFAULT_BRIDGE_DB_PATH, resolve_bridge_db_path
@@ -107,7 +108,7 @@ __all__ = [
     # leases
     "ClaimedDelivery", "FinalizationResult", "PreAdapterReleaseResult",
     "SingletonDispatcherLease", "claim_delivery", "finalize_attempt",
-    "pre_adapter_release",
+    "pre_adapter_mark", "pre_adapter_release",
     # location
     "DEFAULT_BRIDGE_DB_PATH", "resolve_bridge_db_path",
     # migrations
