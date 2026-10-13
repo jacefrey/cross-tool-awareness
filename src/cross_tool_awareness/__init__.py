@@ -16,6 +16,7 @@ from .capability import (
     rotate_capability,
     verify_capability,
 )
+from .composite_storage import CompositeStorage
 from .contracts import (
     SUMMARY_OMITTED,
     CapabilityDecision,
@@ -100,6 +101,8 @@ __all__ = [
     "PresenceRecord", "PresenceState", "QueueAttempt", "QueueCapability",
     "QueueOutcome", "RegistrationUpdate", "SUMMARY_OMITTED",
     "validate_notice_summary",
+    # composite storage
+    "CompositeStorage",
     # dispatcher
     "BACKOFF_SCHEDULE_SECONDS", "BUDGET_CPU_PCT_IDLE", "BUDGET_PEAK_RSS_MB",
     "BUDGET_SQLITE_LOCK_WAIT_MS_P95", "BUDGET_WAKE_FREQ_PER_MIN_IDLE",
