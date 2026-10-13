@@ -6,7 +6,7 @@ machine-manager/docs/superpowers/specs/2026-10-11-shared-awareness-package-desig
 v0.3.1. Fixture-only. Not authorized for live use.
 """
 
-from .adapter import WakeAdapter, WakeNotice
+from .adapter import BoundedAdapter, WakeAdapter, WakeNotice
 from .backup import BackupResult, BackupVerificationFailure, create_backup
 from .capability import (
     BearerCapability,
@@ -85,7 +85,7 @@ __version__ = "0.3.1"
 __all__ = [
     "__version__",
     # adapters
-    "WakeAdapter", "WakeNotice",
+    "BoundedAdapter", "WakeAdapter", "WakeNotice",
     # backup
     "BackupResult", "BackupVerificationFailure", "create_backup",
     # capability

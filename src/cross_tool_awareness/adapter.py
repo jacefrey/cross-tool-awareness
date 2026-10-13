@@ -9,9 +9,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Protocol
 from uuid import UUID
 
 from . import contracts
+from .contracts import PresenceRecord, QueueAttempt
+from .leases import ClaimedDelivery as DeliveryClaim
 
 
 @dataclass(frozen=True)
@@ -61,3 +64,23 @@ class WakeAdapter(ABC):
         resume a stopped session. Must not retry internally. Must not shell out
         via alias.
         """
+
+
+class BoundedAdapter(Protocol):
+    """Adapter that honors a wall-clock budget.
+
+    Implementations MUST raise ``TimeoutError`` if elapsed wall-clock time
+    inside ``invoke`` exceeds ``timeout_seconds`` and MUST NOT return a
+    ``QueueAttempt`` once that boundary has been crossed. Callers (e.g.
+    the sender-side composite) rely on this contract to bound their claim
+    lease; a non-honoring implementation blocks claim recovery.
+    """
+
+    def invoke(
+        self,
+        claim: DeliveryClaim,
+        registration: PresenceRecord,
+        fixed_notice: str,
+        *,
+        timeout_seconds: int,
+    ) -> QueueAttempt: ...
