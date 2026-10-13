@@ -1,6 +1,7 @@
--- Shared awareness schema v2 (v0.2.0)
--- Design authority: machine-manager/docs/superpowers/specs/2026-10-11-shared-awareness-package-design.md v4
+-- Shared awareness schema v3 (v0.4.0)
+-- Design authority: machine-manager/docs/superpowers/specs/2026-10-12-shared-awareness-package-v0.4-design.md v3.1
 -- Contract authority: codex-manager/docs/superpowers/specs/2026-10-05-codex-gate1-contracts.md (0087ebe)
+-- Prior version: machine-manager/docs/superpowers/specs/2026-10-11-shared-awareness-package-design.md v4 (schema v2 / v0.2.0)
 
 -- 3.1 session_registrations
 CREATE TABLE IF NOT EXISTS session_registrations (
@@ -19,10 +20,13 @@ CREATE TABLE IF NOT EXISTS session_registrations (
     heartbeat_at                INTEGER NOT NULL,
     expires_at                  INTEGER NOT NULL,
     revoked_at                  INTEGER,
-    proc_start_ns               INTEGER,
+    holder_pid                  INTEGER NOT NULL,
+    process_started_at          INTEGER NOT NULL,
     PRIMARY KEY (session_uuid, session_incarnation_id),
     CHECK (started_at <= heartbeat_at),
-    CHECK (heartbeat_at <= expires_at)
+    CHECK (heartbeat_at <= expires_at),
+    CHECK (holder_pid >= 0),
+    CHECK (holder_pid > 0 OR state IN ('stale', 'stopping'))
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_alias_live
@@ -62,10 +66,11 @@ CREATE TABLE IF NOT EXISTS targeted_deliveries (
     sender_session_uuid                 TEXT NOT NULL,
     sender_session_incarnation_id       TEXT NOT NULL,
     delivery_state                      TEXT NOT NULL CHECK (delivery_state IN (
-        'pending', 'claimed', 'notified', 'ambiguous', 'blocked', 'observed', 'undeliverable'
+        'pending', 'claimed', 'dispatching', 'notified', 'ambiguous', 'blocked', 'observed', 'undeliverable'
     )),
     claim_lease_token                   TEXT,
     claim_lease_expires_at              INTEGER,
+    dispatch_started_at                 INTEGER,
     created_at                          INTEGER NOT NULL,
     attempt_count                       INTEGER NOT NULL DEFAULT 0,
     next_attempt_at                     INTEGER NOT NULL,
@@ -145,7 +150,7 @@ BEGIN
         WHERE message_id = NEW.message_id
           AND target_session_uuid = NEW.target_session_uuid
           AND target_session_incarnation_id = NEW.target_session_incarnation_id
-          AND delivery_state IN ('claimed', 'notified', 'ambiguous')
+          AND delivery_state IN ('claimed', 'dispatching', 'notified', 'ambiguous')
     );
 END;
 
@@ -159,7 +164,7 @@ BEGIN
     WHERE message_id = NEW.message_id
       AND target_session_uuid = NEW.target_session_uuid
       AND target_session_incarnation_id = NEW.target_session_incarnation_id
-      AND delivery_state IN ('claimed', 'notified', 'ambiguous');
+      AND delivery_state IN ('claimed', 'dispatching', 'notified', 'ambiguous');
 END;
 
 -- 3.6 dispatcher_lease

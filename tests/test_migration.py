@@ -95,6 +95,38 @@ def test_rollback_refuses_on_in_flight_delivery(file_db_migrated, tmp_path):
     assert "in-flight" in result.reason
 
 
+def test_rollback_refuses_on_dispatching_delivery(file_db_migrated, tmp_path):
+    """v0.4 regression (codex-manager mm-cxm-coord seq=229): the `dispatching`
+    state must be treated as in-flight by rollback.
+
+    A delivery parked in `dispatching` is deliberately in the
+    uncertain-side-effect state — adapter may have already queued the notice
+    with the Codex CLI, awaiting reconciliation via receipt or same-token
+    finalization. Allowing rollback to drop the table while a `dispatching`
+    row exists would silently discard the ambiguity-safe contract and lose
+    the ability to reconcile the user-visible side effect.
+    """
+    import uuid as _uuid
+    with sqlite3.connect(str(file_db_migrated)) as db:
+        db.execute("INSERT INTO messages (id) VALUES ('m-dispatching')")
+        db.execute(
+            "INSERT INTO targeted_deliveries "
+            "(message_id, target_session_uuid, target_session_incarnation_id, "
+            " sender_session_uuid, sender_session_incarnation_id, delivery_state, "
+            " claim_lease_token, dispatch_started_at, "
+            " created_at, next_attempt_at, expires_at) "
+            "VALUES ('m-dispatching', ?, ?, ?, ?, 'dispatching', 'lease-xyz', "
+            " 1_000_050, 1, 1, 1_000_000)",
+            (str(_uuid.uuid4()), str(_uuid.uuid4()),
+             str(_uuid.uuid4()), str(_uuid.uuid4())),
+        )
+    result = rollback_migration(file_db_migrated,
+                                backup_dir=tmp_path / "backups5b",
+                                now=1_000_100)
+    assert result.status == "refused"
+    assert "in-flight" in result.reason
+
+
 def test_rollback_refuses_on_live_dispatcher_lease(file_db_migrated, tmp_path):
     with sqlite3.connect(str(file_db_migrated)) as db:
         db.execute(
@@ -117,9 +149,10 @@ def test_rollback_refuses_on_live_capability(file_db_migrated, tmp_path):
             "INSERT INTO session_registrations "
             "(session_uuid, session_incarnation_id, alias, tool, project_slug, "
             " project_root, role, state, wake_capability, registration_fence, "
-            " wake_locator, started_at, heartbeat_at, expires_at) "
+            " wake_locator, started_at, heartbeat_at, expires_at, "
+            " holder_pid, process_started_at) "
             "VALUES (?, ?, 'a', 'codex', 'p', '/tmp/p', 'manager', 'idle', "
-            " 'codex_queue', 'f', 'l', 1, 2, 1_002_000)",
+            " 'codex_queue', 'f', 'l', 1, 2, 1_002_000, 1, 1)",
             (sid, inc),
         )
         db.execute(

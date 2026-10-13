@@ -105,14 +105,16 @@ def _register(conn: sqlite3.Connection, presence: PresenceRecord, *, now: int) -
         "INSERT INTO session_registrations ("
         " session_uuid, session_incarnation_id, alias, tool, project_slug,"
         " project_root, role, state, wake_capability, registration_fence,"
-        " wake_locator, started_at, heartbeat_at, expires_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " wake_locator, started_at, heartbeat_at, expires_at,"
+        " holder_pid, process_started_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (str(presence.session_uuid), str(presence.session_incarnation_id),
          presence.alias, presence.tool, presence.project_slug,
          presence.project_root, presence.role, presence.state,
          presence.wake_capability, presence.registration_fence,
          presence.wake_locator, presence.started_at,
-         presence.heartbeat_at, presence.expires_at),
+         presence.heartbeat_at, presence.expires_at,
+         1, presence.started_at),
     )
     conn.commit()
 

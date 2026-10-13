@@ -30,18 +30,21 @@ def _insert_delivery(db, *, message_id, target_uuid, target_incarnation,
 def _insert_registration(db, *, alias=None, revoked_at=None,
                          started_at=1_000_000, heartbeat_at=1_000_010,
                          expires_at=1_000_000 + 86400,
-                         session_uuid=None, session_incarnation=None):
+                         session_uuid=None, session_incarnation=None,
+                         holder_pid=1, process_started_at=None):
     sid = session_uuid or _u()
     inc = session_incarnation or _u()
     db.execute(
         "INSERT INTO session_registrations "
         "(session_uuid, session_incarnation_id, alias, tool, project_slug, "
         " project_root, role, state, wake_capability, registration_fence, "
-        " wake_locator, started_at, heartbeat_at, expires_at, revoked_at) "
+        " wake_locator, started_at, heartbeat_at, expires_at, revoked_at, "
+        " holder_pid, process_started_at) "
         "VALUES (?, ?, ?, 'codex', 'p', '/tmp/p', 'manager', 'idle', "
-        " 'codex_queue', 'f', 'l', ?, ?, ?, ?)",
+        " 'codex_queue', 'f', 'l', ?, ?, ?, ?, ?, ?)",
         (sid, inc, alias or f"alias-{sid[:8]}", started_at, heartbeat_at,
-         expires_at, revoked_at),
+         expires_at, revoked_at,
+         holder_pid, process_started_at if process_started_at is not None else started_at),
     )
     return sid, inc
 
