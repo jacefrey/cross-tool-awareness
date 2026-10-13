@@ -15,8 +15,18 @@ from cross_tool_awareness import (
     reconcile_blocked,
     run_one_iteration,
 )
-from cross_tool_awareness.registry import register_session
+from cross_tool_awareness.registry import register_session as _register_session
 from .fixtures.fake_adapter import FakeAdapter
+
+
+def register_session(db, presence, *, now):
+    return _register_session(
+        db,
+        presence,
+        now=now,
+        holder_pid=12_345,
+        process_started_at=presence.started_at,
+    )
 
 
 def _u() -> str:

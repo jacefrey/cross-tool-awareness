@@ -9,11 +9,9 @@ UUIDs are serialized to str at the SQL binding boundary (SQLite stores TEXT).
 
 from __future__ import annotations
 
-import os
 import sqlite3
-from typing import Optional
 
-from .contracts import PresenceRecord
+from .contracts import PresenceRecord, _unix_seconds
 
 
 def register_session(
@@ -21,26 +19,25 @@ def register_session(
     presence: PresenceRecord,
     *,
     now: int,
-    holder_pid: Optional[int] = None,
-    process_started_at: Optional[int] = None,
+    holder_pid: int,
+    process_started_at: int,
 ) -> None:
     """Insert a new PresenceRecord, retiring any expired same-alias row first.
 
     Raises sqlite3.IntegrityError if the alias is held by a LIVE (non-expired,
     non-revoked) different registration.
 
-    v0.4 schema v3: ``holder_pid`` and ``process_started_at`` are now stored
-    columns. In this bridging C1 commit they are optional kwargs that fall
-    back to the current process's PID and ``now`` so the full test suite stays
-    green between the schema landing and the C2 commit that makes them strict
-    required kwargs with full validation. Callers that want M9/M10 liveness
-    guarantees MUST pass the real OS values; defaults are only for test fixtures
-    at this bridge point.
+    ``holder_pid`` must be a positive, non-bool integer. The process start
+    time uses the package's strict Unix-second validation. Both values are
+    persisted atomically with the registration row.
     """
-    if holder_pid is None:
-        holder_pid = os.getpid()
-    if process_started_at is None:
-        process_started_at = now
+    if (
+        isinstance(holder_pid, bool)
+        or not isinstance(holder_pid, int)
+        or holder_pid <= 0
+    ):
+        raise ValueError("holder_pid must be a positive integer")
+    process_started_at = _unix_seconds(process_started_at, "process_started_at")
     with db:
         db.execute(
             "UPDATE session_registrations SET revoked_at = ? "
