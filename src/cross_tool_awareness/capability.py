@@ -17,10 +17,21 @@ from __future__ import annotations
 import hashlib
 import hmac
 import sqlite3
-from typing import Callable
+from contextlib import contextmanager
+from typing import Callable, Iterator, Protocol
+from uuid import UUID
 
 from ._txn import exclusive
 from .contracts import CapabilityDecision
+
+
+class ProcessProof(Protocol):
+    """Structural receiver-owned observation consumed by live verification."""
+
+    pid: int
+    process_started_at: int
+    observed_at: int
+    alive: bool
 
 
 class PresenceExpiringSoonError(Exception):
@@ -132,9 +143,13 @@ def verify_capability(
     expected_fence: str,
     now: int,
 ) -> CapabilityDecision:
-    """Transaction-neutral verification. Returns CapabilityDecision(allowed, reason)
-    with reason tokens matching codex-manager: accepted / invalid_contract /
-    revoked / expired / identity_mismatch / invalid_bearer."""
+    """Verify a bearer without asserting that its sender is currently live.
+
+    This transaction-neutral audit/replay check returns reason tokens matching
+    codex-manager: accepted / invalid_contract / revoked / expired /
+    identity_mismatch / invalid_bearer. Code requiring current process
+    liveness must call ``verify_capability_with_liveness`` instead.
+    """
     if not isinstance(presented_bearer, (bytes, bytearray)) or len(presented_bearer) != 32:
         return CapabilityDecision(allowed=False, reason="invalid_contract")
 
@@ -160,6 +175,157 @@ def verify_capability(
     if not hmac.compare_digest(bytes(row["verifier_sha256"]), verifier):
         return CapabilityDecision(allowed=False, reason="invalid_bearer")
     return CapabilityDecision(allowed=True, reason="accepted")
+
+
+@contextmanager
+def _immediate(db: sqlite3.Connection) -> Iterator[None]:
+    """Run one explicit BEGIN IMMEDIATE transaction on ``db``."""
+    if db.in_transaction:
+        db.commit()
+    saved_isolation = db.isolation_level
+    db.isolation_level = None
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            db.execute("ROLLBACK")
+            raise
+        else:
+            db.execute("COMMIT")
+    finally:
+        db.isolation_level = saved_isolation
+
+
+def verify_capability_with_liveness(
+    db: sqlite3.Connection,
+    presented_bearer: bytes,
+    *,
+    expected_sender_uuid: UUID,
+    expected_incarnation: UUID,
+    expected_fence: str,
+    now: int,
+    max_proof_age_seconds: int,
+    observe_process: Callable[[int, int], ProcessProof | None],
+) -> CapabilityDecision:
+    """Verify a bearer and a receiver-owned observation of its live sender.
+
+    The durable PID/start pair is read under ``BEGIN IMMEDIATE``. The OS probe
+    then runs outside every database transaction and must not use this
+    connection. A second ``BEGIN IMMEDIATE`` read rejects registration drift
+    before accepting the proof. This closes the database-identity side of the
+    race; it cannot promise that a process remains alive after return.
+    """
+    if (
+        isinstance(max_proof_age_seconds, bool)
+        or not isinstance(max_proof_age_seconds, int)
+        or max_proof_age_seconds <= 0
+    ):
+        raise ValueError("max_proof_age_seconds must be a positive int")
+    if not callable(observe_process):
+        raise ValueError("observe_process must be callable")
+
+    with _immediate(db):
+        bearer_decision = verify_capability(
+            db,
+            presented_bearer,
+            expected_sender_uuid=expected_sender_uuid,
+            expected_incarnation=expected_incarnation,
+            expected_fence=expected_fence,
+            now=now,
+        )
+        if not bearer_decision.allowed:
+            return bearer_decision
+        first = _live_process_row(
+            db,
+            expected_sender_uuid=expected_sender_uuid,
+            expected_incarnation=expected_incarnation,
+            expected_fence=expected_fence,
+            now=now,
+        )
+        if first is None:
+            return CapabilityDecision(False, "sender_not_live")
+
+    try:
+        proof = observe_process(first["holder_pid"], first["process_started_at"])
+        if proof is None or proof.alive is not True:
+            return CapabilityDecision(False, "probe_failure")
+        proof_pid = proof.pid
+        proof_started_at = proof.process_started_at
+        proof_observed_at = proof.observed_at
+    except Exception:
+        return CapabilityDecision(False, "probe_failure")
+
+    with _immediate(db):
+        second = db.execute(
+            "SELECT session_uuid, session_incarnation_id, registration_fence, "
+            "       state, holder_pid, process_started_at, heartbeat_at "
+            "FROM session_registrations "
+            "WHERE session_uuid = ? AND session_incarnation_id = ? "
+            "  AND revoked_at IS NULL AND expires_at > ?",
+            (
+                str(expected_sender_uuid),
+                str(expected_incarnation),
+                int(now),
+            ),
+        ).fetchone()
+        if second is None:
+            return CapabilityDecision(False, "sender_not_live")
+        identity_fields = (
+            "session_uuid",
+            "session_incarnation_id",
+            "registration_fence",
+            "state",
+        )
+        if any(second[field] != first[field] for field in identity_fields):
+            return CapabilityDecision(False, "sender_not_live")
+        if second["state"] not in ("active", "busy", "idle"):
+            return CapabilityDecision(False, "sender_not_live")
+        if (
+            second["holder_pid"] != first["holder_pid"]
+            or second["process_started_at"] != first["process_started_at"]
+        ):
+            return CapabilityDecision(False, "process_identity_mismatch")
+
+    if (
+        proof_pid != first["holder_pid"]
+        or proof_started_at != first["process_started_at"]
+    ):
+        return CapabilityDecision(False, "process_identity_mismatch")
+    if (
+        not isinstance(proof_observed_at, int)
+        or isinstance(proof_observed_at, bool)
+        or proof_observed_at > now
+        or now - proof_observed_at > max_proof_age_seconds
+    ):
+        return CapabilityDecision(False, "proof_stale")
+    return CapabilityDecision(True, "accepted")
+
+
+def _live_process_row(
+    db: sqlite3.Connection,
+    *,
+    expected_sender_uuid: UUID,
+    expected_incarnation: UUID,
+    expected_fence: str,
+    now: int,
+):
+    db.row_factory = sqlite3.Row
+    return db.execute(
+        "SELECT session_uuid, session_incarnation_id, registration_fence, "
+        "       state, holder_pid, process_started_at, heartbeat_at "
+        "FROM session_registrations "
+        "WHERE session_uuid = ? AND session_incarnation_id = ? "
+        "  AND registration_fence = ? "
+        "  AND state IN ('active', 'busy', 'idle') "
+        "  AND revoked_at IS NULL AND expires_at > ?",
+        (
+            str(expected_sender_uuid),
+            str(expected_incarnation),
+            expected_fence,
+            int(now),
+        ),
+    ).fetchone()
 
 
 def revoke_capability(db, verifier_sha256: bytes, *, now: int) -> None:

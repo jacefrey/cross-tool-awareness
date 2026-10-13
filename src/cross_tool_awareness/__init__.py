@@ -15,6 +15,7 @@ from .capability import (
     revoke_capability,
     rotate_capability,
     verify_capability,
+    verify_capability_with_liveness,
 )
 from .composite_storage import CompositeStorage
 from .contracts import (
@@ -94,7 +95,8 @@ __all__ = [
     "BackupResult", "BackupVerificationFailure", "create_backup",
     # capability
     "BearerCapability", "PresenceExpiringSoonError",
-    "issue_capability", "revoke_capability", "rotate_capability", "verify_capability",
+    "issue_capability", "revoke_capability", "rotate_capability",
+    "verify_capability", "verify_capability_with_liveness",
     # contracts
     "CapabilityDecision", "ClaimStatus", "DeliveryState", "Disposition",
     "DispositionReceipt", "NoticeClaim", "NoticeKey", "NoticeObservation",
