@@ -3,7 +3,7 @@
 See the design spec at
 machine-manager/docs/superpowers/specs/2026-10-11-shared-awareness-package-design.md
 
-v0.3.1. Fixture-only. Not authorized for live use.
+v0.4.0. Fixture-only. Not authorized for live use.
 """
 
 from .adapter import BoundedAdapter, WakeAdapter, WakeNotice
@@ -85,7 +85,7 @@ from .storage import (
     create_authenticated_targeted_send,
 )
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 __all__ = [
     "__version__",

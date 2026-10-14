@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.4.0 (2026-10-13)
+
+Task 9 follow-up batch implementing M3, M6, M1, M9, and M10 from the
+[shared-awareness package design](https://github.com/jacefrey/machine-manager/blob/main/docs/superpowers/specs/2026-10-11-shared-awareness-package-design.md).
+The package remains fixture-only and is not authorized for live use.
+
+- Added the six public interfaces required by the downstream composite:
+  `BoundedAdapter`, `pre_adapter_mark`, `StuckDispatching`,
+  `list_stuck_dispatching`, `CompositeStorage`, and
+  `verify_capability_with_liveness`.
+- Added schema v3 and the guarded v2→v3 migration. Existing registrations are
+  retained for foreign-key and audit history but forced to the legacy-safe
+  posture: `state='stale'`, `holder_pid=0`, and a populated `revoked_at`.
+  Existing delivery rows are preserved while gaining the `dispatching` state
+  and `dispatch_started_at` field.
+- Changed `register_session` to require truthful keyword-only `holder_pid` and
+  `process_started_at` values, with strict validation and same-primary-key
+  rejection across fresh incarnation UUIDs.
+- Added bounded adapter conformance, pre-adapter dispatch fencing, stuck-row
+  inspection and operator reconciliation recipes, the immutable six-method
+  storage facade, and receiver-owned two-read process-liveness verification.
+- Closed the pre-release acceptance findings with migration row-count checks,
+  atomic claim/fence capture, caller-transaction-safe liveness verification,
+  and an end-to-end migrated-registration regression.
+- The tracked release artifact now contains 45 files; 220 tests pass at the
+  pre-C8 checkpoint.
+
 ## 0.3.1 (2026-10-12)
 
 Point release correcting a version-constant drift surfaced by machine-manager's
