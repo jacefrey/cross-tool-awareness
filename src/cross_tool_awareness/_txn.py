@@ -46,6 +46,28 @@ from typing import Iterator
 
 
 @contextmanager
+def immediate(db: sqlite3.Connection) -> Iterator[None]:
+    """Acquire BEGIN IMMEDIATE without consuming caller-owned work."""
+    if db.in_transaction:
+        raise sqlite3.OperationalError(
+            "BEGIN IMMEDIATE requires no active caller transaction"
+        )
+    saved_isolation = db.isolation_level
+    db.isolation_level = None
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            db.execute("ROLLBACK")
+            raise
+        else:
+            db.execute("COMMIT")
+    finally:
+        db.isolation_level = saved_isolation
+
+
+@contextmanager
 def exclusive(db: sqlite3.Connection) -> Iterator[None]:
     """Acquire BEGIN EXCLUSIVE for the duration of the block."""
     if db.in_transaction:

@@ -34,8 +34,12 @@ from cross_tool_awareness import (
     MANAGED_INDEXES,
     MANAGED_TABLES,
     MANAGED_TRIGGERS,
+    PresenceRecord,
     apply as apply_migration,
+    issue_capability,
+    verify_capability_with_liveness,
 )
+from cross_tool_awareness.registry import register_session
 from cross_tool_awareness.migrations import PACKAGE_VERSION
 
 
@@ -304,6 +308,75 @@ def test_live_alias_is_released_so_v4_can_re_register(tmp_path):
             (new_uuid, new_inc, now, now + 10, now + 86_400, 42, now),
         )
         db.commit()
+
+
+def test_migrated_alias_can_register_and_pass_public_liveness_verification(
+    tmp_path,
+):
+    path = tmp_path / "bridge.db"
+    seeded = _seed_v2_bridge(path)
+    now = 2_000_000
+    result = apply_migration(path, backup_dir=tmp_path / "backups", now=now)
+    assert result.status == "applied"
+
+    with sqlite3.connect(str(path)) as db:
+        db.row_factory = sqlite3.Row
+        fresh = PresenceRecord(
+            session_uuid=uuid.uuid4(),
+            session_incarnation_id=uuid.uuid4(),
+            alias="live-alias",
+            tool="codex",
+            project_slug="p",
+            project_root="/tmp/p",
+            role="manager",
+            state="active",
+            wake_capability="codex_queue",
+            registration_fence="fresh-fence",
+            wake_locator="fresh-locator",
+            started_at=now,
+            heartbeat_at=now + 5,
+            expires_at=now + 86_400,
+        )
+        register_session(
+            db,
+            fresh,
+            now=now + 10,
+            holder_pid=4321,
+            process_started_at=now - 100,
+        )
+        bearer = issue_capability(
+            db,
+            session_uuid=fresh.session_uuid,
+            session_incarnation_id=fresh.session_incarnation_id,
+            now=now + 20,
+            entropy_source=lambda size: b"\xa5" * size,
+        )
+        db.commit()
+
+        class Proof:
+            pid = 4321
+            process_started_at = now - 100
+            observed_at = now + 25
+            alive = True
+
+        decision = verify_capability_with_liveness(
+            db,
+            bearer.present(),
+            expected_sender_uuid=fresh.session_uuid,
+            expected_incarnation=fresh.session_incarnation_id,
+            expected_fence=fresh.registration_fence,
+            now=now + 30,
+            max_proof_age_seconds=10,
+            observe_process=lambda *_: Proof(),
+        )
+
+        assert (decision.allowed, decision.reason) == (True, "accepted")
+        legacy = db.execute(
+            "SELECT state, holder_pid, revoked_at FROM session_registrations "
+            "WHERE session_uuid = ? AND session_incarnation_id = ?",
+            seeded["reg_live"],
+        ).fetchone()
+        assert tuple(legacy) == ("stale", 0, now)
 
 
 def test_delivery_rows_preserved_with_null_dispatch_started_at(tmp_path):

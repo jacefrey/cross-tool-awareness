@@ -17,11 +17,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import sqlite3
-from contextlib import contextmanager
-from typing import Callable, Iterator, Protocol
+from typing import Callable, Protocol
 from uuid import UUID
 
-from ._txn import exclusive
+from ._txn import exclusive, immediate
 from .contracts import CapabilityDecision
 
 
@@ -177,26 +176,6 @@ def verify_capability(
     return CapabilityDecision(allowed=True, reason="accepted")
 
 
-@contextmanager
-def _immediate(db: sqlite3.Connection) -> Iterator[None]:
-    """Run one explicit BEGIN IMMEDIATE transaction on ``db``."""
-    if db.in_transaction:
-        db.commit()
-    saved_isolation = db.isolation_level
-    db.isolation_level = None
-    try:
-        db.execute("BEGIN IMMEDIATE")
-        try:
-            yield
-        except BaseException:
-            db.execute("ROLLBACK")
-            raise
-        else:
-            db.execute("COMMIT")
-    finally:
-        db.isolation_level = saved_isolation
-
-
 def verify_capability_with_liveness(
     db: sqlite3.Connection,
     presented_bearer: bytes,
@@ -225,7 +204,7 @@ def verify_capability_with_liveness(
     if not callable(observe_process):
         raise ValueError("observe_process must be callable")
 
-    with _immediate(db):
+    with immediate(db):
         bearer_decision = verify_capability(
             db,
             presented_bearer,
@@ -256,7 +235,7 @@ def verify_capability_with_liveness(
     except Exception:
         return CapabilityDecision(False, "probe_failure")
 
-    with _immediate(db):
+    with immediate(db):
         second = db.execute(
             "SELECT session_uuid, session_incarnation_id, registration_fence, "
             "       state, holder_pid, process_started_at, heartbeat_at "

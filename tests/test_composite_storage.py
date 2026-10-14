@@ -147,6 +147,32 @@ def test_pending_count_and_claim_recovery_after_round_trip(
     assert expiry == 1_000_137
 
 
+def test_claim_and_registration_fence_capture_share_one_immediate_transaction(
+    db, make_presence_fn
+):
+    presence = make_presence_fn()
+    _register(db, presence)
+    _pending(db, presence)
+    db.commit()
+    statements = []
+    db.set_trace_callback(statements.append)
+
+    claim = _storage(db).claim_delivery(1_000_100, recovery_after=30)
+
+    assert claim is not None
+    begin = statements.index("BEGIN IMMEDIATE")
+    update = next(
+        i for i, sql in enumerate(statements)
+        if sql.startswith("UPDATE targeted_deliveries")
+    )
+    fence = next(
+        i for i, sql in enumerate(statements)
+        if sql.startswith("SELECT registration_fence")
+    )
+    commit = statements.index("COMMIT")
+    assert begin < update < fence < commit
+
+
 @pytest.mark.parametrize("bad", [0, -1, True, 1.5, None])
 def test_claim_delivery_rejects_invalid_recovery_after(db, bad):
     with pytest.raises(ValueError, match="recovery_after"):

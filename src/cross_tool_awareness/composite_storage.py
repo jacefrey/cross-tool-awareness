@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, field
 
+from ._txn import immediate
 from .contracts import (
     DispositionReceipt,
     PresenceRecord,
@@ -12,7 +13,7 @@ from .contracts import (
 )
 from .leases import (
     ClaimedDelivery,
-    claim_delivery as _claim_delivery,
+    _claim_delivery_in_transaction,
     finalize_attempt as _finalize_attempt,
     pre_adapter_mark as _pre_adapter_mark,
 )
@@ -68,22 +69,32 @@ class CompositeStorage:
             or recovery_after <= 0
         ):
             raise ValueError("recovery_after must be a positive int")
-        claim = _claim_delivery(
-            self._db,
-            now=now,
-            lease_ttl_seconds=recovery_after,
-        )
-        if claim is not None:
-            row = self._db.execute(
-                "SELECT registration_fence FROM session_registrations "
-                "WHERE session_uuid = ? AND session_incarnation_id = ?",
-                (
-                    str(claim.target_session_uuid),
-                    str(claim.target_session_incarnation_id),
-                ),
-            ).fetchone()
-            if row is not None:
-                self._claim_fences[claim.claim_lease_token] = row[0]
+        # The package claim primitive is an atomic entry point and has always
+        # committed an in-flight implicit transaction before claiming. Keep
+        # that public behavior, then bind the claim and registration fence in
+        # one new write transaction below.
+        if self._db.in_transaction:
+            self._db.commit()
+        fence = None
+        with immediate(self._db):
+            claim = _claim_delivery_in_transaction(
+                self._db,
+                now=now,
+                lease_ttl_seconds=recovery_after,
+            )
+            if claim is not None:
+                row = self._db.execute(
+                    "SELECT registration_fence FROM session_registrations "
+                    "WHERE session_uuid = ? AND session_incarnation_id = ?",
+                    (
+                        str(claim.target_session_uuid),
+                        str(claim.target_session_incarnation_id),
+                    ),
+                ).fetchone()
+                if row is not None:
+                    fence = row[0]
+        if claim is not None and fence is not None:
+            self._claim_fences[claim.claim_lease_token] = fence
         return claim
 
     def revalidate_claim(

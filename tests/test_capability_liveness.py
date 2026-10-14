@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import sqlite3
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -104,6 +105,29 @@ def test_valid_bearer_live_sender_and_fresh_receiver_proof_are_accepted(
         "BEGIN IMMEDIATE",
         "BEGIN IMMEDIATE",
     ]
+
+
+def test_active_caller_transaction_is_refused_without_committing_it(
+    db, make_presence_fn
+):
+    presence, capability = _setup(db, make_presence_fn)
+    marker = str(uuid4())
+    db.execute("INSERT INTO messages (id) VALUES (?)", (marker,))
+    assert db.in_transaction is True
+
+    with pytest.raises(sqlite3.OperationalError, match="active caller transaction"):
+        _verify(
+            db,
+            presence,
+            capability,
+            lambda *_: pytest.fail("probe must not run"),
+        )
+
+    assert db.in_transaction is True
+    db.rollback()
+    assert db.execute(
+        "SELECT 1 FROM messages WHERE id = ?", (marker,)
+    ).fetchone() is None
 
 
 def test_newer_heartbeat_does_not_replace_os_proof_freshness(

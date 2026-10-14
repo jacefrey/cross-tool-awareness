@@ -136,39 +136,51 @@ def claim_delivery(
 
     ``dispatching`` rows are never eligible, regardless of age.
     """
-    token = secrets.token_hex(16)
     with db:
-        db.row_factory = sqlite3.Row
-        row = db.execute(
-            "SELECT message_id, target_session_uuid, target_session_incarnation_id, "
-            "       delivery_state, claim_lease_token "
-            "FROM targeted_deliveries "
-            "WHERE (delivery_state = 'pending' AND next_attempt_at <= ?) "
-            "   OR (delivery_state = 'claimed' AND claim_lease_expires_at <= ?) "
-            "ORDER BY CASE WHEN delivery_state = 'pending' THEN next_attempt_at "
-            "              ELSE claim_lease_expires_at END ASC "
-            "LIMIT 1",
-            (now, now),
-        ).fetchone()
-        if row is None:
-            return None
-        cur = db.execute(
-            "UPDATE targeted_deliveries "
-            "SET delivery_state = 'claimed', claim_lease_token = ?, "
-            "    claim_lease_expires_at = ? "
-            "WHERE message_id = ? AND target_session_uuid = ? "
-            "  AND target_session_incarnation_id = ? "
-            "  AND ((delivery_state = 'pending') "
-            "       OR (delivery_state = 'claimed' "
-            "           AND claim_lease_token = ? "
-            "           AND claim_lease_expires_at <= ?))",
-            (token, now + int(lease_ttl_seconds),
-             row["message_id"], row["target_session_uuid"],
-             row["target_session_incarnation_id"],
-             row["claim_lease_token"], now),
+        return _claim_delivery_in_transaction(
+            db, now=now, lease_ttl_seconds=lease_ttl_seconds
         )
-        if cur.rowcount == 0:
-            return None
+
+
+def _claim_delivery_in_transaction(
+    db: sqlite3.Connection,
+    *,
+    now: int,
+    lease_ttl_seconds: int,
+) -> Optional[ClaimedDelivery]:
+    """Claim inside a transaction already owned by the package."""
+    token = secrets.token_hex(16)
+    db.row_factory = sqlite3.Row
+    row = db.execute(
+        "SELECT message_id, target_session_uuid, target_session_incarnation_id, "
+        "       delivery_state, claim_lease_token "
+        "FROM targeted_deliveries "
+        "WHERE (delivery_state = 'pending' AND next_attempt_at <= ?) "
+        "   OR (delivery_state = 'claimed' AND claim_lease_expires_at <= ?) "
+        "ORDER BY CASE WHEN delivery_state = 'pending' THEN next_attempt_at "
+        "              ELSE claim_lease_expires_at END ASC "
+        "LIMIT 1",
+        (now, now),
+    ).fetchone()
+    if row is None:
+        return None
+    cur = db.execute(
+        "UPDATE targeted_deliveries "
+        "SET delivery_state = 'claimed', claim_lease_token = ?, "
+        "    claim_lease_expires_at = ? "
+        "WHERE message_id = ? AND target_session_uuid = ? "
+        "  AND target_session_incarnation_id = ? "
+        "  AND ((delivery_state = 'pending') "
+        "       OR (delivery_state = 'claimed' "
+        "           AND claim_lease_token = ? "
+        "           AND claim_lease_expires_at <= ?))",
+        (token, now + int(lease_ttl_seconds),
+         row["message_id"], row["target_session_uuid"],
+         row["target_session_incarnation_id"],
+         row["claim_lease_token"], now),
+    )
+    if cur.rowcount == 0:
+        return None
     return ClaimedDelivery(
         message_id=row["message_id"],
         target_session_uuid=row["target_session_uuid"],

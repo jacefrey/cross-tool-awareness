@@ -405,6 +405,13 @@ def _apply_v2_to_v3_migration(db_path: Path, *, now: int) -> None:
         try:
             conn.execute("BEGIN IMMEDIATE")
 
+            registration_count = conn.execute(
+                "SELECT COUNT(*) FROM session_registrations"
+            ).fetchone()[0]
+            delivery_count = conn.execute(
+                "SELECT COUNT(*) FROM targeted_deliveries"
+            ).fetchone()[0]
+
             # 0. Drop all triggers that reference session_registrations or
             # targeted_deliveries by name. SQLite 3.25+ validates trigger
             # bodies at ALTER TABLE RENAME TO time; a trigger that references
@@ -484,6 +491,25 @@ def _apply_v2_to_v3_migration(db_path: Path, *, now: int) -> None:
                 "ON targeted_deliveries(next_attempt_at) "
                 "WHERE delivery_state = 'pending'"
             )
+
+            copied_registration_count = conn.execute(
+                "SELECT COUNT(*) FROM session_registrations"
+            ).fetchone()[0]
+            copied_delivery_count = conn.execute(
+                "SELECT COUNT(*) FROM targeted_deliveries"
+            ).fetchone()[0]
+            if copied_registration_count != registration_count:
+                raise sqlite3.IntegrityError(
+                    "session_registrations row count changed during v2→v3 "
+                    f"rebuild: expected {registration_count}, "
+                    f"copied {copied_registration_count}"
+                )
+            if copied_delivery_count != delivery_count:
+                raise sqlite3.IntegrityError(
+                    "targeted_deliveries row count changed during v2→v3 "
+                    f"rebuild: expected {delivery_count}, "
+                    f"copied {copied_delivery_count}"
+                )
 
             # 3. Recreate the three receipt triggers. Two gain 'dispatching'
             # in their eligible-source WHERE; the live-registration trigger is
