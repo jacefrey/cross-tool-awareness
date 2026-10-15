@@ -67,6 +67,30 @@ def test_revalidate_refuses_lease_expiry_equality(tmp_path):
     assert f.revalidate_claim(claim, 40, lease_token=claim.claim_lease_token) is None
 
 
+def test_facade_mark_refuses_rotated_target_fence_even_after_resnapshot(tmp_path):
+    """The adapter gate honors the fence captured at claim time: a target whose
+    fence rotated since the claim is refused by the facade's mark even if the
+    consumer re-snapshotted after the rotation (and skipped revalidate_claim)."""
+    from cross_tool_awareness.leases import pre_adapter_mark
+    db, cid, target, f, claim = _seed(tmp_path)
+    _set(db, target, "registration_fence", "rotated")
+    fresh_target = snapshot_from_row(db, target, proof_observed_at=10)
+    fresh_claimant = snapshot_from_row(db, cid, proof_observed_at=10)
+    assert f.pre_adapter_mark(claim, 10, lease_token=claim.claim_lease_token,
+                              claimant_snapshot=fresh_claimant, target_snapshot=fresh_target) is False
+    r = db.execute("SELECT delivery_state FROM targeted_deliveries").fetchone()[0]
+    assert r == "claimed"
+    # Low-level: the captured fence is enforced when supplied ...
+    kw = dict(message_id=claim.message_id, target_session_uuid=claim.target_session_uuid,
+              target_session_incarnation_id=claim.target_session_incarnation_id,
+              lease_token=claim.claim_lease_token, now=10, claimant=cid, clock=lambda: 10,
+              claimant_snapshot=fresh_claimant, target_snapshot=fresh_target,
+              tool="claude", wake_capability="notify_only")
+    assert pre_adapter_mark(db, target_registration_fence=claim.target_registration_fence, **kw) is False
+    # ... and the snapshot-vs-row comparison alone still governs when it is not.
+    assert pre_adapter_mark(db, **kw) is True
+
+
 def test_revalidate_refuses_other_route(tmp_path):
     db, cid, target, f, claim = _seed(tmp_path)
     other = _facade(db, cid, tool="claude", wake_capability="claude_socket")

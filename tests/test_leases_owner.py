@@ -332,6 +332,21 @@ def test_pre_adapter_mark_failure_leaves_claim_releasable(tmp_path):
     assert state == "blocked"
 
 
+@pytest.mark.parametrize("bad_state", ["notified", "observed", "dispatching", ""])
+def test_pre_adapter_release_rejects_invalid_next_state(tmp_path, bad_state):
+    """Restored v0.4 invariant: the low-level writer refuses any next_state
+    outside {pending, blocked} with ValueError (not a strippable assert)."""
+    db, cid, target, mid, claim = _claim_and_target(tmp_path)
+    before = dict(db.execute("SELECT * FROM targeted_deliveries WHERE message_id = ?", (mid,)).fetchone())
+    with pytest.raises(ValueError, match="next_state"):
+        pre_adapter_release(db, claim_lease_token=claim.claim_lease_token, next_state=bad_state,
+                            diagnostic="x", next_attempt_at=None, claimant=cid, clock=lambda: 10,
+                            message_id=claim.message_id, target_session_uuid=claim.target_session_uuid,
+                            target_session_incarnation_id=claim.target_session_incarnation_id)
+    assert dict(db.execute("SELECT * FROM targeted_deliveries WHERE message_id = ?", (mid,)).fetchone()) == before
+    assert db.in_transaction is False
+
+
 def test_pre_adapter_release_sql_abort_leaves_row_unchanged(tmp_path):
     db, cid, target, mid, claim = _claim_and_target(tmp_path)
     before = dict(db.execute("SELECT * FROM targeted_deliveries WHERE message_id = ?", (mid,)).fetchone())

@@ -403,9 +403,16 @@ def pre_adapter_mark(
     target_snapshot: RegistrationSnapshot,
     tool: str,
     wake_capability: str,
+    target_registration_fence: Optional[str] = None,
 ) -> bool:
     """Atomically transition the exact owned claim to ``dispatching`` AND write
     the ``dispatch_ownership`` witness, in a single ``BEGIN IMMEDIATE`` txn.
+
+    ``target_registration_fence``, when supplied (the facade always passes the
+    fence captured on the ``ClaimedDelivery``), additionally requires the
+    target snapshot to carry that fence, so a target whose fence rotated since
+    the claim is refused at the adapter gate even if the caller re-snapshotted
+    after the rotation.
 
     Returns False when any gate fails: stale snapshot, claimant not live in
     SQL, wrong owner / token / key / state, or any insert collision. On False
@@ -440,7 +447,7 @@ def pre_adapter_mark(
         if _registration_matches_snapshot(
             db, snapshot=target_snapshot,
             expected_key=(target_session_uuid, target_session_incarnation_id),
-            expected_fence=None,
+            expected_fence=target_registration_fence,
             now=completion_now, route=(tool, wake_capability),
         ) is not None:
             return False
@@ -561,7 +568,9 @@ def pre_adapter_release(
     changed, so no snapshot/route re-check at this point (design R5
     rationale on release not taking route params).
     """
-    assert next_state in ("pending", "blocked"), f"invalid pre-adapter next_state {next_state!r}"
+    if next_state not in ("pending", "blocked"):
+        raise ValueError(f"invalid pre-adapter next_state {next_state!r}; "
+                         "must be 'pending' or 'blocked'")
     _assert_no_active_transaction(db)
     _ = int(clock())  # kwarg consumed for API-shape consistency; not read here
     with immediate(db):

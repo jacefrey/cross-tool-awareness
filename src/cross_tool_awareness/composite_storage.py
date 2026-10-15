@@ -249,6 +249,7 @@ class CompositeStorage:
             target_snapshot=target_snapshot,
             tool=self.tool,
             wake_capability=self.wake_capability,
+            target_registration_fence=claim.target_registration_fence,
         )
 
     def finalize_attempt(

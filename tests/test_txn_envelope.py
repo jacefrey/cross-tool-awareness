@@ -106,6 +106,26 @@ def test_failed_rollback_preserves_primary_and_invalidates_connection(tmp_path, 
 
 
 @pytest.mark.parametrize("iso", ISOLATION)
+@pytest.mark.parametrize("helper", HELPERS, ids=["immediate", "exclusive"])
+def test_sqlite_auto_rollback_keeps_connection_usable(tmp_path, iso, helper):
+    """SQLITE_FULL (and INTERRUPT/IOERR) roll the transaction back inside SQLite
+    itself; the envelope must not mistake its own now-pointless ROLLBACK error
+    for an unresolved transaction and close the consumer's connection."""
+    p = _file(tmp_path)
+    db = _open(p, iso)
+    pages = db.execute("PRAGMA page_count").fetchone()[0]
+    db.execute(f"PRAGMA max_page_count = {pages}")
+    with pytest.raises(sqlite3.OperationalError, match="full"):
+        with helper(db):
+            for _ in range(64):
+                db.execute("INSERT INTO t VALUES (zeroblob(4096))")
+    assert db.in_transaction is False
+    assert db.execute("SELECT 1").fetchone()[0] == 1          # still open and usable
+    assert _fresh_count(p) == 0
+    assert _fresh_can_write(p)
+
+
+@pytest.mark.parametrize("iso", ISOLATION)
 def test_caller_transaction_refused_and_untouched(tmp_path, iso):
     p = _file(tmp_path)
     db = _open(p, iso)

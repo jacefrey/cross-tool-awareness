@@ -37,14 +37,27 @@ def _run_owned(db: sqlite3.Connection, begin_sql: str) -> Iterator[None]:
         yield
         db.execute("COMMIT")
     except BaseException:
-        try:
-            db.execute("ROLLBACK")
-        except sqlite3.Error:
+        # SQLITE_FULL / INTERRUPT / IOERR already rolled the transaction back
+        # inside SQLite; only an UNRESOLVED transaction needs our ROLLBACK, and
+        # only a transaction that survives a failed ROLLBACK justifies
+        # invalidating the consumer's connection.
+        if _in_transaction(db):
             try:
-                db.close()
+                db.execute("ROLLBACK")
             except sqlite3.Error:
-                pass
+                if _in_transaction(db):
+                    try:
+                        db.close()   # never let a later statement or setter commit this
+                    except sqlite3.Error:
+                        pass
         raise
+
+
+def _in_transaction(db: sqlite3.Connection) -> bool:
+    try:
+        return db.in_transaction
+    except sqlite3.ProgrammingError:   # already closed
+        return False
 
 
 @contextmanager
