@@ -16,6 +16,8 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Callable
 
+from typing import Optional
+
 from .contracts import (
     ClaimantIdentity,
     DispositionReceipt,
@@ -30,6 +32,27 @@ from .leases import (
     pre_adapter_mark as _pre_adapter_mark,
     pre_adapter_release as _pre_adapter_release,
 )
+
+
+@dataclass(frozen=True)
+class CompositeFinalizationResult:
+    """Facade-level finalize result surfacing BOTH the leases status and
+    any attached disposition receipt in one object.
+
+    The pre-fix facade collapsed every non-``receipt_already_won`` status
+    to ``None``, which forced a CXM-consumer to re-read SQL to tell a
+    successful ``finalized`` apart from an ``unauthorized`` rejection or
+    an idempotent ``already_finalized``. Returning this dataclass lets
+    the caller branch on ``status`` directly.
+
+    Field semantics mirror ``leases.FinalizationResult``, with an extra
+    ``receipt`` populated iff ``status == 'receipt_already_won'``.
+    """
+
+    status: str
+    new_state: Optional[str] = None
+    attempt_recorded: bool = False
+    receipt: Optional[DispositionReceipt] = None
 
 
 @dataclass(frozen=True, init=False)
@@ -219,7 +242,25 @@ class CompositeStorage:
         attempt: QueueAttempt,
         *,
         lease_token: str,
-    ) -> DispositionReceipt | None:
+    ) -> CompositeFinalizationResult:
+        """Finalize an in-flight attempt, surfacing the full status.
+
+        Returns a ``CompositeFinalizationResult``. Possible statuses:
+          - ``'finalized'``: attempt recorded + delivery state advanced.
+            ``new_state`` carries the new delivery_state. ``receipt`` None.
+          - ``'unauthorized'``: wrong owner / wrong token / wrong key.
+            Zero rows changed. ``attempt_recorded`` False. ``receipt`` None.
+          - ``'already_finalized'``: exact retry of a previously-recorded
+            attempt (UNIQUE on claim_lease_token). ``attempt_recorded``
+            False (the prior row remains).
+          - ``'lease_already_released'``: witness matched but delivery had
+            no in-flight state when the UPDATE ran (recovery or operator
+            reconciliation after mark).
+          - ``'receipt_already_won'``: receipt arrived first; attempt row
+            IS recorded (so the attempt history is honest) but the delivery
+            remains ``observed``. ``receipt`` is populated with the
+            winning receipt.
+        """
         if (
             str(attempt.message_id) != str(claim.message_id)
             or str(attempt.target_session_uuid)
@@ -244,19 +285,26 @@ class CompositeStorage:
             claimant=self.claimant,
             clock=self._clock,
         )
-        if result.status != "receipt_already_won":
-            return None
-        row = self._db.execute(
-            "SELECT * FROM disposition_receipts "
-            "WHERE message_id = ? AND target_session_uuid = ? "
-            "  AND target_session_incarnation_id = ?",
-            (
-                str(claim.message_id),
-                str(claim.target_session_uuid),
-                str(claim.target_session_incarnation_id),
-            ),
-        ).fetchone()
-        return _receipt_from_row(row) if row is not None else None
+        receipt: Optional[DispositionReceipt] = None
+        if result.status == "receipt_already_won":
+            row = self._db.execute(
+                "SELECT * FROM disposition_receipts "
+                "WHERE message_id = ? AND target_session_uuid = ? "
+                "  AND target_session_incarnation_id = ?",
+                (
+                    str(claim.message_id),
+                    str(claim.target_session_uuid),
+                    str(claim.target_session_incarnation_id),
+                ),
+            ).fetchone()
+            if row is not None:
+                receipt = _receipt_from_row(row)
+        return CompositeFinalizationResult(
+            status=result.status,
+            new_state=result.new_state,
+            attempt_recorded=result.attempt_recorded,
+            receipt=receipt,
+        )
 
 
 def _presence_from_row(row: sqlite3.Row) -> PresenceRecord:

@@ -177,6 +177,48 @@ def test_pre_adapter_mark_inserts_witness_atomic_with_state_change(tmp_path):
 # --- Receipt-wins path preserves the witness (R4, Review Focus item 4) -----
 
 
+def test_receipt_clears_claimant_tuple_on_observed_row(tmp_path):
+    """I2 regression: the receipt trigger must clear the claimant_* trio on
+    the observed delivery row, not just the lease fields. Keeping the
+    claimant tuple stamped on an observed row violates "witness is the sole
+    provenance" (audit queries like WHERE claimant_session_uuid = ? to find
+    'work this session owned' would over-count observed rows)."""
+    db = _fresh_db(tmp_path)
+    cid = _identity()
+    _register(db, cid)
+    target = _identity(fence="target-f")
+    _register(db, target, holder_pid=5678, process_started_at=2_000_000)
+    msg_id = _seed_pending(db, target)
+    claim = _claim_and_mark(db, cid, target, msg_id, now=10)
+    db.execute(
+        "INSERT INTO disposition_receipts("
+        " message_id, target_session_uuid, target_session_incarnation_id,"
+        " correlation_id, consumer_id, receiver_session_uuid,"
+        " receiver_session_incarnation_id, disposition, observed_at, reason,"
+        " delivered_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (claim.message_id, claim.target_session_uuid,
+         claim.target_session_incarnation_id, _u(), "codex-receiver",
+         claim.target_session_uuid, claim.target_session_incarnation_id,
+         "accepted", 20, "", 20),
+    )
+    row = db.execute(
+        "SELECT delivery_state,"
+        " claim_lease_token, claim_lease_expires_at,"
+        " claimant_session_uuid, claimant_session_incarnation_id,"
+        " claimant_registration_fence"
+        " FROM targeted_deliveries WHERE message_id = ?", (claim.message_id,),
+    ).fetchone()
+    assert row["delivery_state"] == "observed"
+    # Pre-fix: these three were still populated with cid's values. Post-fix:
+    # all three NULL so the delivery row doesn't lie about who owned it.
+    assert row["claimant_session_uuid"] is None
+    assert row["claimant_session_incarnation_id"] is None
+    assert row["claimant_registration_fence"] is None
+    # Lease fields still cleared (unchanged behavior).
+    assert row["claim_lease_token"] is None
+    assert row["claim_lease_expires_at"] is None
+
+
 def test_witness_retained_after_receipt_wins(tmp_path):
     db = _fresh_db(tmp_path)
     cid = _identity()

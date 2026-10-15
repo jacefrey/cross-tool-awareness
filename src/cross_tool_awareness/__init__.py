@@ -19,7 +19,7 @@ from .capability import (
     verify_capability,
     verify_capability_with_liveness,
 )
-from .composite_storage import CompositeStorage
+from .composite_storage import CompositeFinalizationResult, CompositeStorage
 from .contracts import (
     SUMMARY_OMITTED,
     CapabilityDecision,
@@ -118,7 +118,7 @@ __all__ = [
     "QueueOutcome", "RegistrationSnapshot", "RegistrationUpdate",
     "SUMMARY_OMITTED", "validate_notice_summary",
     # composite storage
-    "CompositeStorage",
+    "CompositeFinalizationResult", "CompositeStorage",
     # dispatcher
     "BACKOFF_SCHEDULE_SECONDS", "BUDGET_CPU_PCT_IDLE", "BUDGET_PEAK_RSS_MB",
     "BUDGET_SQLITE_LOCK_WAIT_MS_P95", "BUDGET_WAKE_FREQ_PER_MIN_IDLE",

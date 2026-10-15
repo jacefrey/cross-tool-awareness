@@ -183,7 +183,10 @@ BEGIN
     UPDATE targeted_deliveries
     SET delivery_state = 'observed',
         claim_lease_token = NULL,
-        claim_lease_expires_at = NULL
+        claim_lease_expires_at = NULL,
+        claimant_session_uuid = NULL,
+        claimant_session_incarnation_id = NULL,
+        claimant_registration_fence = NULL
     WHERE message_id = NEW.message_id
       AND target_session_uuid = NEW.target_session_uuid
       AND target_session_incarnation_id = NEW.target_session_incarnation_id

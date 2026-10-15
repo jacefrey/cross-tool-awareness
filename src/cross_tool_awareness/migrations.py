@@ -689,6 +689,28 @@ CREATE INDEX idx_dispatch_ownership_delivery
 """
 
 
+# v4 trigger: clears claimant_* alongside the lease fields so an observed row
+# doesn't lie about ownership (the dispatch_ownership witness is the sole
+# retained provenance after a receipt wins).
+_V4_TRIGGER_RECEIPT_MARKS_OBSERVED = """
+CREATE TRIGGER tr_receipt_marks_observed
+AFTER INSERT ON disposition_receipts
+BEGIN
+    UPDATE targeted_deliveries
+    SET delivery_state = 'observed',
+        claim_lease_token = NULL,
+        claim_lease_expires_at = NULL,
+        claimant_session_uuid = NULL,
+        claimant_session_incarnation_id = NULL,
+        claimant_registration_fence = NULL
+    WHERE message_id = NEW.message_id
+      AND target_session_uuid = NEW.target_session_uuid
+      AND target_session_incarnation_id = NEW.target_session_incarnation_id
+      AND delivery_state IN ('claimed', 'dispatching', 'notified', 'ambiguous');
+END
+"""
+
+
 def _v4_quiescence_refusal_reason(db: sqlite3.Connection) -> Optional[str]:
     """Return a refusal reason if any delivery is in a non-quiescent state, else None.
 
@@ -797,10 +819,12 @@ def _apply_v3_to_v4_migration(db_path: Path, *, now: int) -> None:
             conn.execute(_V4_DISPATCH_OWNERSHIP)
             conn.execute(_V4_DISPATCH_OWNERSHIP_INDEX)
 
-            # Recreate the receipt triggers verbatim (unchanged by v4).
+            # Recreate the receipt triggers. tr_receipt_marks_observed gets
+            # the v4 body which also clears claimant_* on the observed row —
+            # the other two are unchanged from v3.
             conn.execute(_V3_TRIGGER_RECEIPT_REQUIRES_LIVE_REGISTRATION)
             conn.execute(_V3_TRIGGER_RECEIPT_ELIGIBLE)
-            conn.execute(_V3_TRIGGER_RECEIPT_MARKS_OBSERVED)
+            conn.execute(_V4_TRIGGER_RECEIPT_MARKS_OBSERVED)
 
             fk_violations = conn.execute("PRAGMA foreign_key_check").fetchall()
             if fk_violations:

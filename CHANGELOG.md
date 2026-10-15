@@ -79,9 +79,31 @@ Design authority:
 - `SingletonDispatcherLease` class is unchanged.
 
 ### Verification
-- 241/241 tests pass locally on tip of `feat/v05-claimant-ownership`.
+- 245/245 tests pass locally on tip of `feat/v05-claimant-ownership`.
 - Independent acceptance is pending (CXM fresh-context review + separate
   MM fresh-session acceptance before merge).
+
+### Fix pass (post-fresh-review)
+Two Important findings from MM's fresh-context Opus whole-branch review
+addressed in commit `<fix pass>`:
+
+- **I1:** `CompositeStorage.finalize_attempt` now returns a
+  `CompositeFinalizationResult` surfacing status + new_state +
+  attempt_recorded + receipt, rather than collapsing all non-receipt-wins
+  statuses to `None`. A CXM-consumer can now distinguish `finalized` from
+  `unauthorized` from `already_finalized` from `lease_already_released`
+  from `receipt_already_won` without re-reading SQL.
+- **I2:** `tr_receipt_marks_observed` trigger (v4 body) now also clears
+  `claimant_session_uuid`, `claimant_session_incarnation_id`, and
+  `claimant_registration_fence` on the observed row — alongside the lease
+  fields. The dispatch_ownership witness remains the sole retained
+  provenance after a receipt wins, so audit queries like
+  `WHERE claimant_session_uuid = ?` to find "work this session owned"
+  do not over-count observed rows. v3→v4 migration recreates the
+  trigger with the v4 body; v2→v3 keeps its v3 body (claimant_* columns
+  do not exist until v3→v4 completes).
+
+Minor findings (M1–M5) deferred, see release evidence doc.
 
 ## 0.4.0 (2026-10-13)
 

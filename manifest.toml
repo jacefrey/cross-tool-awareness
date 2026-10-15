@@ -23,6 +23,6 @@ contracts_source = "codex-manager/docs/superpowers/specs/2026-10-05-codex-gate1-
 contracts_source_commit = "0087ebe"
 
 package_version = "0.5.0"
-package_sha256 = "7d34767b1f045f0c49c32972fb31af37f8a1cb02f6275cbfe032326355db1616"
+package_sha256 = "a91f82243b86d9df0014f1a0c9944583a0cf6971f960f68bc3818523b4bb4271"
 
 changelog_heading = "Changelog"
