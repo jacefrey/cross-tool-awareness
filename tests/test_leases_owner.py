@@ -277,3 +277,71 @@ def test_claim_delivery_rejects_stale_snapshot(tmp_path):
 
 # Rollback-on-exception coverage for every writer (with real failure
 # injection, BaseException included) lives in tests/test_writer_rollback.py.
+
+
+# --- Restored low-level lease invariants (v0.4 test_leases.py) --------------
+
+
+def _claim_and_target(tmp_path):
+    db = _fresh_db(tmp_path)
+    cid = _make_identity()
+    _register(db, cid)
+    target = _make_identity(fence="target-f")
+    _register(db, target, holder_pid=5678, process_started_at=2_000_000)
+    seed = _seed_pending_delivery(db, target, now=10)
+    claim = claim_delivery(db, now=10, claimant=cid, clock=lambda: 10,
+                           claimant_snapshot=_snapshot(cid),
+                           tool="claude", wake_capability="notify_only")
+    assert claim is not None
+    return db, cid, target, seed["message_id"], claim
+
+
+def _mark_with(db, cid, target, claim, *, message_id=None, token=None):
+    return pre_adapter_mark(
+        db, message_id=message_id or claim.message_id,
+        target_session_uuid=claim.target_session_uuid,
+        target_session_incarnation_id=claim.target_session_incarnation_id,
+        lease_token=token or claim.claim_lease_token, now=10,
+        claimant=cid, clock=lambda: 10,
+        claimant_snapshot=_snapshot(cid),
+        target_snapshot=_snapshot(target, holder_pid=5678, process_started_at=2_000_000),
+        tool="claude", wake_capability="notify_only",
+    )
+
+
+def test_pre_adapter_mark_rejects_missing_wrong_token_and_repeat(tmp_path):
+    db, cid, target, mid, claim = _claim_and_target(tmp_path)
+    assert _mark_with(db, cid, target, claim, message_id=_u()) is False      # unknown key
+    assert _mark_with(db, cid, target, claim, token="wrong") is False         # wrong token
+    assert _mark_with(db, cid, target, claim) is True                         # exact
+    assert _mark_with(db, cid, target, claim) is False                        # repeat
+    assert db.execute("SELECT COUNT(*) FROM dispatch_ownership").fetchone()[0] == 1
+
+
+def test_pre_adapter_mark_failure_leaves_claim_releasable(tmp_path):
+    db, cid, target, mid, claim = _claim_and_target(tmp_path)
+    assert _mark_with(db, cid, target, claim, token="wrong") is False
+    r = pre_adapter_release(db, claim_lease_token=claim.claim_lease_token, next_state="blocked",
+                            diagnostic="adapter_disabled", next_attempt_at=None,
+                            claimant=cid, clock=lambda: 10, message_id=claim.message_id,
+                            target_session_uuid=claim.target_session_uuid,
+                            target_session_incarnation_id=claim.target_session_incarnation_id)
+    assert r.status == "released"
+    state = db.execute("SELECT delivery_state FROM targeted_deliveries WHERE message_id = ?",
+                       (mid,)).fetchone()[0]
+    assert state == "blocked"
+
+
+def test_pre_adapter_release_sql_abort_leaves_row_unchanged(tmp_path):
+    db, cid, target, mid, claim = _claim_and_target(tmp_path)
+    before = dict(db.execute("SELECT * FROM targeted_deliveries WHERE message_id = ?", (mid,)).fetchone())
+    db.execute("CREATE TRIGGER tr_test_abort BEFORE UPDATE ON targeted_deliveries"
+               " BEGIN SELECT RAISE(ABORT, 'fixture'); END")
+    with pytest.raises(sqlite3.IntegrityError, match="fixture"):
+        pre_adapter_release(db, claim_lease_token=claim.claim_lease_token, next_state="blocked",
+                            diagnostic="x", next_attempt_at=None, claimant=cid, clock=lambda: 10,
+                            message_id=claim.message_id, target_session_uuid=claim.target_session_uuid,
+                            target_session_incarnation_id=claim.target_session_incarnation_id)
+    assert db.in_transaction is False
+    assert dict(db.execute("SELECT * FROM targeted_deliveries WHERE message_id = ?", (mid,)).fetchone()) == before
+    db.execute("DROP TRIGGER tr_test_abort")

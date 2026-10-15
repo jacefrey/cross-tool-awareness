@@ -106,6 +106,55 @@ def test_run_one_iteration_raises_with_exploding_args():
         )
 
 
+# --- Completed tripwire coverage (v0.5.1 remediation, A3) --------------------
+
+_EXACT = "legacy dispatcher disabled: claimant-aware bounded runner required"
+
+
+def test_disabled_callables_and_probe_result_remain_in_all():
+    import cross_tool_awareness
+    assert {"run_one_iteration", "run_foreground_probe", "ProbeResult"} <= set(cross_tool_awareness.__all__)
+
+
+def test_direct_module_callables_raise_exact_message(tmp_path):
+    from cross_tool_awareness import dispatcher, probe
+    with pytest.raises(RuntimeError) as e1:
+        dispatcher.run_one_iteration()
+    assert str(e1.value) == _EXACT
+    with pytest.raises(RuntimeError) as e2:
+        probe.run_foreground_probe(db_path=tmp_path / "x.db", adapters={}, singleton_lease=_ExplodingLease(),
+                                   duration_seconds=0, now=_exploding_clock)
+    assert str(e2.value) == _EXACT
+
+
+@pytest.mark.parametrize("duration", [0, 3])
+def test_probe_trips_no_connect_clock_sleep_or_measurement(tmp_path, monkeypatch, duration):
+    import resource
+    import sqlite3
+    import time
+    from cross_tool_awareness import probe
+
+    def trip(name):
+        def _f(*a, **k):
+            raise AssertionError(f"{name} must not be called")
+        return _f
+
+    monkeypatch.setattr(sqlite3, "connect", trip("sqlite3.connect"))
+    monkeypatch.setattr(time, "sleep", trip("time.sleep"))
+    monkeypatch.setattr(time, "monotonic", trip("time.monotonic"))
+    monkeypatch.setattr(time, "time", trip("time.time"))
+    monkeypatch.setattr(resource, "getrusage", trip("resource.getrusage"))
+    with pytest.raises(RuntimeError, match="legacy dispatcher disabled"):
+        probe.run_foreground_probe(db_path=tmp_path / "x.db", adapters={"codex_queue": _ExplodingAdapter()},
+                                   singleton_lease=_ExplodingLease(), duration_seconds=duration,
+                                   now=_exploding_clock)
+    with pytest.raises(RuntimeError, match="legacy dispatcher disabled"):
+        run_foreground_probe(db_path=tmp_path / "x.db", adapters={"codex_queue": _ExplodingAdapter()},
+                             singleton_lease=_ExplodingLease(), duration_seconds=duration,
+                             now=_exploding_clock)
+    assert not (tmp_path / "x.db").exists()
+
+
 # --- ProbeResult remains importable as inert data ---------------------------
 
 
