@@ -1,31 +1,49 @@
-"""Foreground probe entrypoint for pre-LaunchAgent cost/lock/singleton measurement.
+"""Foreground probe entrypoint — DISABLED in v0.5.0.
 
-See spec §10.
+The pre-v0.5 probe exercised an owner-less dispatcher iteration loop as the
+pre-LaunchAgent cost/lock/singleton measurement surface. v0.5.0 (design R5)
+disables that path: ``run_foreground_probe`` raises ``RuntimeError`` before
+any side effect — before DB connection, lease acquisition, clock calls,
+sleeping, measurement, or adapter access — including a zero-duration call.
+
+The replacement claimant-aware bounded runner is a later roadmap gate.
+``ProbeResult`` remains importable as an inert data type for consumers that
+destructure results from older recordings; ``run_foreground_probe`` is kept
+in ``__all__`` for symbol stability but fails closed on every call.
 """
 
-import resource
-import sqlite3
-import statistics
-import time
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
 from .adapter import WakeAdapter
-from .dispatcher import (
+# NB: dispatcher.* budgets are preserved for __init__ re-exports; this module
+# does not consume them in the disabled body, but importing them keeps the
+# cross-module symbol surface stable for existing recordings.
+from .dispatcher import (  # noqa: F401  (re-exported by package __init__)
     BUDGET_CPU_PCT_IDLE,
     BUDGET_PEAK_RSS_MB,
     BUDGET_SQLITE_LOCK_WAIT_MS_P95,
     BUDGET_WAKE_FREQ_PER_MIN_IDLE,
     POLL_INTERVAL_IDLE_SECONDS,
-    run_one_iteration,
 )
-from .leases import SingletonDispatcherLease
+from .leases import SingletonDispatcherLease  # noqa: F401  (API-shape stability)
+
+
+_LEGACY_DISABLED_REASON = (
+    "legacy dispatcher disabled: claimant-aware bounded runner required"
+)
 
 
 @dataclass
 class ProbeResult:
-    status: str                    # 'pass' | 'fail'
+    """Inert data type retained for v0.4-era consumers that destructure
+    saved probe results. v0.5.0 never produces one — run_foreground_probe
+    raises before any measurement — but the dataclass is kept importable."""
+
+    status: str
     iterations: int
     attempts: int
     receipts: int
@@ -44,116 +62,15 @@ def run_foreground_probe(
     adapters: Mapping[str, WakeAdapter],
     singleton_lease: SingletonDispatcherLease,
     duration_seconds: int,
-    now: Callable[[], int] = lambda: int(time.time()),
+    now: Callable[[], int] = None,  # noqa: RUF013 (keep API shape)
     poll_interval_seconds: float = POLL_INTERVAL_IDLE_SECONDS,
     budgets: Optional[dict] = None,
 ) -> ProbeResult:
-    """Run the dispatcher loop in the foreground for a bounded duration."""
-    db = sqlite3.connect(str(db_path))
-    try:
-        db.execute("PRAGMA foreign_keys = ON")
+    """DISABLED in v0.5.0 — raises RuntimeError before any side effect.
 
-        if not singleton_lease.acquire(now=now()):
-            raise RuntimeError("could not acquire singleton dispatcher lease")
-
-        start_wall = time.time()
-        start_cpu = time.process_time()
-        iterations = 0
-        attempts_recorded = 0
-        ttl_swept_total = 0
-        singleton_steals = 0
-        lock_wait_samples_ms: list[float] = []
-        iteration_timestamps: list[float] = []
-
-        try:
-            while True:
-                elapsed = time.time() - start_wall
-                if elapsed >= duration_seconds:
-                    break
-
-                iter_start = time.monotonic()
-                result = run_one_iteration(
-                    db, adapters=adapters, now=now,
-                    singleton_lease=singleton_lease,
-                )
-                iter_end = time.monotonic()
-                lock_wait_samples_ms.append((iter_end - iter_start) * 1000.0)
-                iteration_timestamps.append(time.time())
-                iterations += 1
-
-                if result.status == "lease_lost":
-                    singleton_steals += 1
-                    break
-
-                attempts_recorded += result.attempts_recorded
-                ttl_swept_total += result.ttl_swept
-
-                # Sleep between iterations.
-                remaining = duration_seconds - (time.time() - start_wall)
-                sleep_for = min(poll_interval_seconds, max(0, remaining))
-                if sleep_for > 0:
-                    time.sleep(sleep_for)
-        finally:
-            singleton_lease.release()
-
-        end_wall = time.time()
-        end_cpu = time.process_time()
-
-        # Metrics.
-        rss_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        # On macOS, ru_maxrss is bytes; on Linux, kilobytes. Normalize.
-        import sys
-        if sys.platform == "darwin":
-            peak_rss_mb = rss_bytes / (1024 * 1024)
-        else:
-            peak_rss_mb = rss_bytes / 1024
-
-        wall_elapsed = max(1e-9, end_wall - start_wall)
-        cpu_elapsed = max(0.0, end_cpu - start_cpu)
-        cpu_pct_idle = 100.0 * cpu_elapsed / wall_elapsed if wall_elapsed > 0 else 0.0
-
-        if lock_wait_samples_ms:
-            try:
-                p95 = statistics.quantiles(lock_wait_samples_ms, n=20)[18]
-            except statistics.StatisticsError:
-                p95 = max(lock_wait_samples_ms)
-        else:
-            p95 = 0.0
-
-        wake_freq_per_min = (iterations * 60.0) / wall_elapsed if wall_elapsed > 0 else 0.0
-
-        # Count receipts via a lightweight SELECT.
-        receipts = db.execute(
-            "SELECT COUNT(*) FROM disposition_receipts "
-            "WHERE observed_at >= ?",
-            (int(start_wall),),
-        ).fetchone()[0]
-
-        budget_results = {
-            "peak_rss_mb":              (peak_rss_mb, BUDGET_PEAK_RSS_MB,
-                                         peak_rss_mb <= BUDGET_PEAK_RSS_MB),
-            "cpu_pct_idle":             (cpu_pct_idle, BUDGET_CPU_PCT_IDLE,
-                                         cpu_pct_idle <= BUDGET_CPU_PCT_IDLE),
-            "lock_wait_ms_p95":         (p95, BUDGET_SQLITE_LOCK_WAIT_MS_P95,
-                                         p95 <= BUDGET_SQLITE_LOCK_WAIT_MS_P95),
-            "wake_freq_per_min_idle":   (wake_freq_per_min, BUDGET_WAKE_FREQ_PER_MIN_IDLE,
-                                         wake_freq_per_min <= BUDGET_WAKE_FREQ_PER_MIN_IDLE),
-            "singleton_steal_attempts": (singleton_steals, 0, singleton_steals == 0),
-        }
-        all_pass = all(v[2] for v in budget_results.values())
-
-        return ProbeResult(
-            status="pass" if all_pass else "fail",
-            iterations=iterations,
-            attempts=attempts_recorded,
-            receipts=receipts,
-            ttl_sweeps=ttl_swept_total,
-            peak_rss_mb=peak_rss_mb,
-            cpu_pct_idle=cpu_pct_idle,
-            lock_wait_ms_p95=p95,
-            wake_freq_per_min_idle=wake_freq_per_min,
-            singleton_steal_attempts=singleton_steals,
-            budget_results=budget_results,
-        )
-    finally:
-        db.close()
+    No DB connection is opened. No lease is acquired. No clock is called
+    (``now`` is never invoked). No sleep occurs. No adapter is called. The
+    body contains zero logic beyond the raise, so ``duration_seconds=0``
+    and any adapter/lease/clock argument shape still raises.
+    """
+    raise RuntimeError(_LEGACY_DISABLED_REASON)

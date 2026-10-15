@@ -52,6 +52,8 @@ from .dispatcher import (
     NoticeFactory,
     POLL_INTERVAL_ACTIVE_SECONDS,
     POLL_INTERVAL_IDLE_SECONDS,
+    # DISABLED in v0.5.0: raises RuntimeError on every call. Kept importable
+    # for symbol stability; see CHANGELOG v0.5.0 §Disabled.
     run_one_iteration,
 )
 from .leases import (
@@ -78,7 +80,14 @@ from .migrations import (
     apply,
     rollback,
 )
-from .probe import ProbeResult, run_foreground_probe
+from .probe import (
+    ProbeResult,
+    # DISABLED in v0.5.0: raises RuntimeError BEFORE any DB connection,
+    # lease acquisition, clock call, sleep, measurement, or adapter access —
+    # including duration_seconds=0. ProbeResult remains importable as an
+    # inert data type for v0.4-era saved recordings. See CHANGELOG v0.5.0.
+    run_foreground_probe,
+)
 from .reconciliation import ReconciliationResult, reconcile_ambiguous, reconcile_blocked
 from .registry import register_session, revoke_session
 from .storage import (

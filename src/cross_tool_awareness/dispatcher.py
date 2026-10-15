@@ -116,24 +116,32 @@ def _revalidate_target(delivery, registration, *, expected_proc_start_ns):
     return True
 
 
+_LEGACY_DISABLED_REASON = (
+    "legacy dispatcher disabled: claimant-aware bounded runner required"
+)
+
+
 def run_one_iteration(
-    db: sqlite3.Connection,
+    db: sqlite3.Connection = None,
     *,
-    adapters: Mapping[str, WakeAdapter],
-    singleton_lease: SingletonDispatcherLease,
-    notice_factory: NoticeFactory,
-    now: Callable[[], int] = lambda: int(time.time()),
+    adapters: Mapping[str, WakeAdapter] = None,
+    singleton_lease: SingletonDispatcherLease = None,
+    notice_factory: NoticeFactory = None,
+    now: Callable[[], int] = None,
     expected_proc_start_ns: Optional[int] = None,
 ) -> IterationResult:
-    """Run one dispatcher iteration.
+    """DISABLED in v0.5.0 — raises RuntimeError immediately.
 
-    notice_factory is REQUIRED (v0.2.0). The dispatcher refuses to run without
-    one; placeholder WakeNotice metadata is no longer acceptable per spec §4
-    (no placeholder channel/sender_alias; summary pipes through sanitizer).
+    The pre-v0.5 dispatcher iteration was owner-less; a claimant-aware
+    bounded runner is a later roadmap gate. This callable remains in
+    ``__all__`` for symbol stability but fails closed on every call,
+    regardless of argument shape (missing kwargs or stub objects).
     """
-    if not callable(notice_factory):
-        raise TypeError("notice_factory is required (callable); placeholder notice removed in v0.2.0")
+    raise RuntimeError(_LEGACY_DISABLED_REASON)
 
+    # The pre-v0.5 body is intentionally unreachable below so static
+    # consumers that grep for symbol names still see them. The raise above
+    # guarantees no execution.
     now_s = now()
 
     if not singleton_lease.refresh(now=now_s, lease_ttl_seconds=DISPATCHER_LEASE_TTL_SECONDS):
