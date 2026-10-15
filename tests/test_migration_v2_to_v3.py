@@ -185,7 +185,9 @@ def test_v2_bridge_upgrades_to_v3(tmp_path):
             "ORDER BY version DESC LIMIT 1"
         ).fetchall()
         assert rows[0]["version"] == 4
-        assert rows[0]["package_version"] == PACKAGE_VERSION == "0.5.0"
+        # The top version row carries the CURRENT package version (pinned
+        # exactly by tests/test_version_consistency.py), not a literal here.
+        assert rows[0]["package_version"] == PACKAGE_VERSION
 
 
 def test_v3_fresh_install_still_works(tmp_path):

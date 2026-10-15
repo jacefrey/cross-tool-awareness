@@ -54,7 +54,7 @@ from .backup import BackupResult, BackupVerificationFailure, create_backup
 
 
 EXPECTED_SCHEMA_VERSION = 4
-PACKAGE_VERSION = "0.5.0"
+PACKAGE_VERSION = "0.5.1"
 
 
 MANAGED_TABLES = frozenset({

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cross-tool-awareness"
-version = "0.5.0"
+version = "0.5.1"
 description = "Shared storage + dispatcher primitives for cross-tool awareness between Codex and Claude Code sessions on a single Mac. Owned by machine-manager."
 requires-python = ">=3.12"
 readme = "README.md"

@@ -1,6 +1,107 @@
 # Changelog
 
-## 0.5.0 (2026-10-15)
+## 0.5.1 (2026-10-15)
+
+Remediation candidate for the ten Important correctness findings
+(I01–I10), the deleted-coverage obligations and the Minor from
+codex-manager's independent review of the withdrawn 0.5.0 candidate
+(`mm-cxm-coord` seq 355; review `codex-manager/docs/superpowers/reviews/
+2026-10-15-cta-v05-independent-review.md`, commit `1d52ef0`). Executed
+under the MM remediation plan (rev 3, approved by codex-manager at seq
+371). No design change: every item implements the approved R3–R9 text.
+The package remains fixture-only and is not authorized for live use.
+
+### Fixed (correctness)
+- **I07 / R6** — `_txn.immediate` / `_txn.exclusive` keep the body AND the
+  `COMMIT` inside the rollback boundary, roll back on any `BaseException`,
+  close the connection if `ROLLBACK` itself fails, and no longer assign
+  `isolation_level` at all (CPython's setter commits an open transaction
+  when assigned `None`). Every `leases` writer uses `immediate`.
+  Tests: `test_txn_envelope.py`, `test_writer_rollback.py`.
+- **I01 / R7** — `pre_adapter_mark` and `claim_delivery` read the injected
+  clock after `BEGIN IMMEDIATE`; mark refuses at lease-expiry equality.
+  Tests: `test_write_time_eligibility.py` (lock-wait cases assert zero
+  clock reads before the lock).
+- **I02 / R7–R8** — lease recovery eligibility and the new lease expiry use
+  the post-lock clock (`clock() + recovery_after`); scheduling `now` only
+  gates pending due-ness. Test: `test_scheduling_now_cannot_recover_unexpired_lease`.
+- **I03 / R5 §3.2** — claim and mark compare BOTH snapshots to the current
+  registration rows inside the transaction: identity binding, every
+  `PresenceRecord` field except `heartbeat_at` (`expires_at` included),
+  `holder_pid`/`process_started_at`, unrevoked, unexpired, eligible state,
+  and the target's `(tool, wake_capability)` route. Tests:
+  `test_snapshot_binding.py`.
+- **I04 / R5** — `ClaimedDelivery.target_registration_fence` is captured in
+  the claim transaction; `revalidate_claim` requires it and the claimant's
+  CURRENT live registration. Tests: `test_revalidate_claim.py`.
+- **I05 / R5** — a duplicate-token finalization compares every persisted
+  attempt field: identical → `already_finalized`, different →
+  `altered_retry_rejected`; both change zero rows. Tests:
+  `test_finalize_retry.py`.
+- **I06 / A2** — `pre_adapter_release(next_attempt_at=None)` preserves the
+  stored schedule; the facade's pre-entry release always passes `None`.
+  Tests: `test_release_schedule.py`.
+- **I08 / R9** — exact source-schema validation (artifact set, no
+  managed-namespace extras, canonical SQL text) before any backup and again
+  under the migration lock; canonical v2/v3 schemas ship as package data
+  (`schema_v2.sql`, `schema_v3.sql`) pinned byte-identical to the test
+  fixtures; one SQL parser serves every version. Tests:
+  `test_migration_guarded.py`.
+- **I09 / R9** — each hop runs through `_guarded_hop`: lock → recheck
+  version / source schema / quiescence → per-hop backup (suffix
+  `.from-v2` / `.from-v3`) through `create_backup`'s separate read
+  connection → DDL → exact destination schema + `foreign_key_check` +
+  preserved-table row counts + version row BEFORE `COMMIT`. Every ordinary
+  error returns a `HopOutcome` carrying this hop's backup (or the
+  unverified file path) and the actual version; a failure after a
+  successful commit reports the destination version; only
+  `KeyboardInterrupt` / `SystemExit` propagate. `rollback` runs every
+  refusal check, an exact source-schema check for the installed version,
+  the backup and the drops under one write lock.
+- **I10 / R4** — `rollback` refuses any `dispatch_ownership` row with no
+  `queue_attempts` row matching token AND full delivery key (entered,
+  unfinalized), in addition to delivery orphans. Tests:
+  `test_rollback_guarded.py`.
+- **Minor / R3** — `claimed`/`dispatching` rows and witnesses require a
+  nonempty lease token (schema CHECK + migration DDL). Tests:
+  `test_schema_token_nonempty.py`.
+
+### Added (coverage obligations)
+- Restored facade/lease/reconciliation invariants deleted with the legacy
+  dispatcher (`test_claimant_ownership.py`, `test_reconciliation.py`,
+  `test_leases_owner.py`).
+- Two-process harness (`tests/_owner_fixtures.run_children`): Barrier/Event
+  synchronization, one shared 10 s deadline, one bounded 1 s cleanup phase,
+  SIGKILL after a committed mark, both receipt/finalize orders
+  (`test_claimant_concurrency.py`).
+- Bounded scenario verifier for every seq-355 diagnostic label
+  (`test_seq355_scenarios.py`; run with `-rA`).
+- Tripwire completion for the disabled legacy entry points
+  (`test_legacy_disabled.py`).
+- `tests/test_version_consistency.py`.
+
+### Changed (consumer-visible)
+- `ClaimedDelivery` gains `target_registration_fence: str`.
+- `FinalizationResult.status` / `CompositeFinalizationResult.status` gain
+  `'altered_retry_rejected'`.
+- `leases.pre_adapter_release(next_attempt_at: Optional[int])`.
+- `migrations.apply` returns `refused` for non-canonical v2/v3 sources
+  before any backup; a non-`applied` result after a committed hop carries
+  that hop's backup; `MigrationRefused` and `HopOutcome` are new internals.
+- `create_backup(..., suffix="")`; `BackupVerificationFailure.path`.
+- Consumer rule for ruling R-S (confirmed by codex-manager): a registration
+  expiry extension between snapshot and mark invalidates the snapshot —
+  refuse, re-observe/re-snapshot outside the transaction while still
+  owning a valid pre-entry claim, or release to blocked; never auto-retry
+  an entered/ambiguous dispatch. 30 s is a maximum proof age, not a
+  validity guarantee.
+
+## 0.5.0 (2026-10-15) — candidate withdrawn before acceptance
+
+Candidate `1ac8e5a` (digest `a91f82243b86…`) returned REVISIONS REQUIRED in
+codex-manager's independent review (`mm-cxm-coord` seq 355) and was never
+released, pushed or integrated. Superseded by 0.5.1 above. The original
+entry is retained below for history.
 
 Phase 2b pre-live hardening of CTA against process-contention and legacy
 owner-less entry points. v0.4.0 remains supported for existing consumers
