@@ -1,7 +1,12 @@
--- Shared awareness schema v3 (v0.4.0)
--- Design authority: machine-manager/docs/superpowers/specs/2026-10-12-shared-awareness-package-v0.4-design.md v3.1
+-- Shared awareness schema v4 (v0.5.0 claimant ownership)
+-- Design authority: codex-manager/docs/superpowers/specs/2026-10-14-awareness-pre-live-hardening-design.md (abc1864)
 -- Contract authority: codex-manager/docs/superpowers/specs/2026-10-05-codex-gate1-contracts.md (0087ebe)
--- Prior version: machine-manager/docs/superpowers/specs/2026-10-11-shared-awareness-package-design.md v4 (schema v2 / v0.2.0)
+-- Prior schema: v3 / v0.4.0 (session_registrations.holder_pid + process_started_at;
+--               targeted_deliveries.dispatching state + dispatch_started_at)
+-- v4 delta: targeted_deliveries gains claimant_session_uuid /
+--           claimant_session_incarnation_id / claimant_registration_fence under
+--           all-or-nothing + claimed/dispatching-requires-full-owner CHECK.
+--           New dispatch_ownership witness table keyed by claim_lease_token.
 
 -- 3.1 session_registrations
 CREATE TABLE IF NOT EXISTS session_registrations (
@@ -71,13 +76,31 @@ CREATE TABLE IF NOT EXISTS targeted_deliveries (
     claim_lease_token                   TEXT,
     claim_lease_expires_at              INTEGER,
     dispatch_started_at                 INTEGER,
+    claimant_session_uuid               TEXT,
+    claimant_session_incarnation_id     TEXT,
+    claimant_registration_fence         TEXT,
     created_at                          INTEGER NOT NULL,
     attempt_count                       INTEGER NOT NULL DEFAULT 0,
     next_attempt_at                     INTEGER NOT NULL,
     expires_at                          INTEGER NOT NULL,
     last_error_class                    TEXT,
     PRIMARY KEY (message_id, target_session_uuid, target_session_incarnation_id),
-    FOREIGN KEY (message_id) REFERENCES messages(id)
+    FOREIGN KEY (message_id) REFERENCES messages(id),
+    CHECK (
+        (claimant_session_uuid IS NULL
+         AND claimant_session_incarnation_id IS NULL
+         AND claimant_registration_fence IS NULL)
+        OR
+        (claimant_session_uuid IS NOT NULL
+         AND claimant_session_incarnation_id IS NOT NULL
+         AND claimant_registration_fence IS NOT NULL)
+    ),
+    CHECK (
+        delivery_state NOT IN ('claimed', 'dispatching')
+        OR (claimant_session_uuid IS NOT NULL
+            AND claim_lease_token IS NOT NULL
+            AND claim_lease_expires_at IS NOT NULL)
+    )
 );
 
 CREATE INDEX IF NOT EXISTS idx_delivery_eligible
@@ -199,3 +222,27 @@ CREATE TABLE IF NOT EXISTS notice_claims (
     claimed_at                          INTEGER NOT NULL,
     PRIMARY KEY (message_id, target_session_uuid, target_session_incarnation_id)
 );
+
+-- 3.9 dispatch_ownership (v0.5.0): package-owned dispatch witness, keyed by
+-- claim_lease_token. Written atomically with the delivery's claimed→dispatching
+-- transition inside pre_adapter_mark. Retained after a receipt clears the
+-- delivery's active lease fields: it is the sole proof that a specific
+-- claimant/key/token owned an entered adapter attempt, and finalize_attempt
+-- requires a matching witness to authenticate a late attempt-insert when the
+-- receipt won first. No garbage-collection job: retention/rollback preserves
+-- this history and refuses destructive teardown of unmatched witnesses.
+CREATE TABLE IF NOT EXISTS dispatch_ownership (
+    claim_lease_token                   TEXT NOT NULL PRIMARY KEY,
+    message_id                          TEXT NOT NULL,
+    target_session_uuid                 TEXT NOT NULL,
+    target_session_incarnation_id       TEXT NOT NULL,
+    claimant_session_uuid               TEXT NOT NULL,
+    claimant_session_incarnation_id     TEXT NOT NULL,
+    claimant_registration_fence         TEXT NOT NULL,
+    dispatch_started_at                 INTEGER NOT NULL,
+    FOREIGN KEY (message_id, target_session_uuid, target_session_incarnation_id)
+        REFERENCES targeted_deliveries(message_id, target_session_uuid, target_session_incarnation_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dispatch_ownership_delivery
+    ON dispatch_ownership(message_id, target_session_uuid, target_session_incarnation_id);

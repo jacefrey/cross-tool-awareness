@@ -173,7 +173,8 @@ def test_v2_bridge_upgrades_to_v3(tmp_path):
     result = apply_migration(path, backup_dir=backup_dir, now=now)
 
     assert result.status == "applied", f"migration failed: {result.reason}"
-    assert result.version == 3 == EXPECTED_SCHEMA_VERSION
+    # v0.5.0: EXPECTED_SCHEMA_VERSION is 4; a v2 bridge chains v2→v3→v4.
+    assert result.version == 4 == EXPECTED_SCHEMA_VERSION
     # Backup should have been taken before the destructive rebuild.
     assert result.backup is not None
 
@@ -183,12 +184,12 @@ def test_v2_bridge_upgrades_to_v3(tmp_path):
             "SELECT version, package_version FROM awareness_schema_version "
             "ORDER BY version DESC LIMIT 1"
         ).fetchall()
-        assert rows[0]["version"] == 3
-        assert rows[0]["package_version"] == PACKAGE_VERSION == "0.4.0"
+        assert rows[0]["version"] == 4
+        assert rows[0]["package_version"] == PACKAGE_VERSION == "0.5.0"
 
 
 def test_v3_fresh_install_still_works(tmp_path):
-    """Verify the fresh-install path still ends at EXPECTED_SCHEMA_VERSION=3."""
+    """Verify the fresh-install path ends at EXPECTED_SCHEMA_VERSION (v0.5.0 → 4)."""
     path = tmp_path / "bridge.db"
     conn = sqlite3.connect(str(path))
     conn.execute("PRAGMA foreign_keys = ON")
@@ -197,11 +198,11 @@ def test_v3_fresh_install_still_works(tmp_path):
     result = apply_migration(path, backup_dir=tmp_path / "backups",
                              now=1_000_000)
     assert result.status == "applied"
-    assert result.version == 3
+    assert result.version == 4
 
 
 def test_v3_reapply_is_idempotent(tmp_path):
-    """Running apply() twice on a v3 DB is a no-op after the first application."""
+    """Running apply() twice on a v2 bridge is a no-op after the first chain."""
     path = tmp_path / "bridge.db"
     _seed_v2_bridge(path)
 
@@ -210,7 +211,7 @@ def test_v3_reapply_is_idempotent(tmp_path):
 
     second = apply_migration(path, backup_dir=tmp_path / "backups-2", now=2_001_000)
     assert second.status == "already_at_version"
-    assert second.version == 3
+    assert second.version == 4
 
 
 def test_v2_dry_run_does_not_write(tmp_path):
@@ -228,7 +229,7 @@ def test_v2_dry_run_does_not_write(tmp_path):
         path, backup_dir=tmp_path / "backups", now=2_000_000, dry_run=True,
     )
     assert result.status == "applied"
-    assert result.reason == "dry_run v2→v3"
+    assert result.reason == "dry_run v2→v3→v4"
 
     # No side effects: version row still at 2.
     with sqlite3.connect(str(path)) as db:
@@ -429,11 +430,18 @@ def test_post_migration_schema_accepts_dispatching_state(tmp_path):
     assert result.status == "applied"
 
     with sqlite3.connect(str(path)) as db:
+        # v0.5.0 (schema v4): a dispatching row requires full owner tuple +
+        # claim_lease_token + claim_lease_expires_at. The spirit of this test
+        # (dispatching state is accepted by the schema) is preserved by
+        # supplying those fields.
         db.execute(
             "UPDATE targeted_deliveries SET delivery_state = 'dispatching', "
-            "claim_lease_token = 'tok', dispatch_started_at = 2000001 "
+            "claim_lease_token = 'tok', claim_lease_expires_at = 2000500, "
+            "dispatch_started_at = 2000001, "
+            "claimant_session_uuid = ?, claimant_session_incarnation_id = ?, "
+            "claimant_registration_fence = 'fence-x' "
             "WHERE message_id = ?",
-            (seeded["message_id"],),
+            (_u(), _u(), seeded["message_id"]),
         )
         db.commit()
         row = db.execute(
@@ -524,10 +532,13 @@ def test_post_migration_both_receipt_triggers_accept_dispatching(tmp_path):
             "(message_id, target_session_uuid, target_session_incarnation_id, "
             " sender_session_uuid, sender_session_incarnation_id, delivery_state, "
             " claim_lease_token, claim_lease_expires_at, dispatch_started_at, "
+            " claimant_session_uuid, claimant_session_incarnation_id, "
+            " claimant_registration_fence, "
             " created_at, next_attempt_at, expires_at) "
-            "VALUES (?, ?, ?, ?, ?, 'dispatching', 'lease-xyz', ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, 'dispatching', 'lease-xyz', ?, ?, "
+            " ?, ?, 'fence-y', ?, ?, ?)",
             (msg_id, recv_uuid, recv_inc, _u(), _u(),
-             now + 60, now, now, now, now + 3_600),
+             now + 60, now, _u(), _u(), now, now, now + 3_600),
         )
         db.commit()
 

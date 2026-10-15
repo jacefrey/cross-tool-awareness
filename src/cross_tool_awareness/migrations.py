@@ -23,6 +23,23 @@ v0.4.0 (schema v3) revisions:
   but marked holder_pid=0 + state='stale' + revoked_at populated so the alias
   is released and truthful v0.4 re-registration can replace them with a fresh
   incarnation UUID.
+
+v0.5.0 (schema v4) revisions:
+- EXPECTED_SCHEMA_VERSION bumped from 3 → 4; PACKAGE_VERSION from 0.4.0 → 0.5.0.
+- schema.sql canonical shape is now v4 (targeted_deliveries gains three
+  nullable claimant_* owner-tuple columns under all-or-nothing CHECK + a
+  claimed/dispatching requires-full-owner CHECK; new dispatch_ownership
+  witness table keyed by claim_lease_token with FK to targeted_deliveries).
+- apply() routes a v3-schema DB through _apply_v3_to_v4_migration() and a
+  v2-schema DB through the chain v2→v3→v4 (preserving the accepted v2→v3
+  hop so the older supported path is never silently stranded).
+- Both migration hops refuse to run if any delivery is in claimed /
+  dispatching / notified / ambiguous / blocked state. Refusal happens
+  BEFORE any backup is written or any mutation applied, satisfying R9's
+  "preserve state unchanged" requirement.
+- rollback() refuses when dispatch_ownership rows exist whose delivery key
+  has no matching targeted_deliveries row (R4 "no destructive teardown of
+  unmatched witnesses").
 """
 
 from __future__ import annotations
@@ -36,8 +53,8 @@ from typing import Optional
 from .backup import BackupResult, create_backup
 
 
-EXPECTED_SCHEMA_VERSION = 3
-PACKAGE_VERSION = "0.4.0"
+EXPECTED_SCHEMA_VERSION = 4
+PACKAGE_VERSION = "0.5.0"
 
 
 MANAGED_TABLES = frozenset({
@@ -49,12 +66,14 @@ MANAGED_TABLES = frozenset({
     "dispatcher_lease",
     "awareness_schema_version",
     "notice_claims",
+    "dispatch_ownership",
 })
 
 MANAGED_INDEXES = frozenset({
     "idx_alias_live",
     "idx_tool_state",
     "idx_delivery_eligible",
+    "idx_dispatch_ownership_delivery",
 })
 
 MANAGED_TRIGGERS = frozenset({
@@ -75,9 +94,11 @@ _MANAGED_PREFIXES = (
     "dispatcher_",
     "awareness_",
     "notice_",
+    "dispatch_",
     "idx_alias_",
     "idx_tool_",
     "idx_delivery_",
+    "idx_dispatch_",
     "tr_capability_",
     "tr_receipt_",
 )
@@ -92,6 +113,21 @@ def _expected_managed_set() -> set[tuple[str, str]]:
     for name in MANAGED_TRIGGERS:
         out.add(("trigger", name))
     return out
+
+
+# Artifacts introduced by schema v4. Subtracting these from the current
+# expected set yields the pre-v4 managed set, used to verify a pre-migration
+# backup against the (v2 or v3) shape the DB actually has at that moment.
+# v2 and v3 share the same sqlite_master-level set (both lacked
+# dispatch_ownership + its index), so the same subtraction serves either hop.
+_V4_ADDED_ARTIFACTS = frozenset({
+    ("table", "dispatch_ownership"),
+    ("index", "idx_dispatch_ownership_delivery"),
+})
+
+
+def _pre_v4_managed_set() -> set[tuple[str, str]]:
+    return _expected_managed_set() - _V4_ADDED_ARTIFACTS
 
 
 def _managed_namespace_names() -> set[str]:
@@ -527,11 +563,14 @@ def _apply_v2_to_v3_migration(db_path: Path, *, now: int) -> None:
                     f"{fk_violations!r}"
                 )
 
-            # 5. Record the new version row.
+            # 5. Record the new version row. Pinned to 3 here regardless of
+            # EXPECTED_SCHEMA_VERSION: this function is the v2→v3 hop only and
+            # must stay invariant to downstream version bumps (chained hops
+            # like v2→v3→v4 insert each row separately).
             conn.execute(
                 "INSERT INTO awareness_schema_version "
                 "(version, applied_at, package_version) VALUES (?, ?, ?)",
-                (EXPECTED_SCHEMA_VERSION, now, PACKAGE_VERSION),
+                (3, now, "0.4.0"),
             )
 
             conn.execute("COMMIT")
@@ -563,6 +602,237 @@ def _apply_v2_to_v3_migration(db_path: Path, *, now: int) -> None:
                     raise sqlite3.OperationalError(
                         "PRAGMA foreign_keys=ON could not be restored "
                         "after migration"
+                    )
+        except sqlite3.Error:
+            if primary_exc is None:
+                raise
+        finally:
+            conn.close()
+
+
+# --- v3 → v4 migration -----------------------------------------------------
+
+
+# The refusal set is the design R9 non-quiescent states: any one of these
+# existing in a pre-migration v3 (or v2) DB blocks the v4 migration before any
+# backup or mutation. This is a stronger discipline than what the CHECK alone
+# would require: claimed/dispatching could not survive the new CHECK anyway, but
+# notified/ambiguous/blocked are kept in the refusal set because they still
+# represent in-flight work whose provenance would be silently rewritten by any
+# schema migration this plan does not pre-authorize.
+_V4_REFUSAL_STATES = ("claimed", "dispatching", "notified", "ambiguous", "blocked")
+
+
+# Canonical v4 DDL for the rebuilt targeted_deliveries. Must produce
+# sqlite_master.sql equal (post _normalize_sql) to the canonical schema.sql
+# CREATE TABLE text. Any drift is caught by the post-apply
+# _validate_sql_text_matches_canonical check in apply().
+_V4_REBUILT_TARGETED_DELIVERIES = """
+CREATE TABLE targeted_deliveries (
+    message_id                          TEXT NOT NULL,
+    target_session_uuid                 TEXT NOT NULL,
+    target_session_incarnation_id       TEXT NOT NULL,
+    sender_session_uuid                 TEXT NOT NULL,
+    sender_session_incarnation_id       TEXT NOT NULL,
+    delivery_state                      TEXT NOT NULL CHECK (delivery_state IN (
+        'pending', 'claimed', 'dispatching', 'notified', 'ambiguous', 'blocked', 'observed', 'undeliverable'
+    )),
+    claim_lease_token                   TEXT,
+    claim_lease_expires_at              INTEGER,
+    dispatch_started_at                 INTEGER,
+    claimant_session_uuid               TEXT,
+    claimant_session_incarnation_id     TEXT,
+    claimant_registration_fence         TEXT,
+    created_at                          INTEGER NOT NULL,
+    attempt_count                       INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at                     INTEGER NOT NULL,
+    expires_at                          INTEGER NOT NULL,
+    last_error_class                    TEXT,
+    PRIMARY KEY (message_id, target_session_uuid, target_session_incarnation_id),
+    FOREIGN KEY (message_id) REFERENCES messages(id),
+    CHECK (
+        (claimant_session_uuid IS NULL
+         AND claimant_session_incarnation_id IS NULL
+         AND claimant_registration_fence IS NULL)
+        OR
+        (claimant_session_uuid IS NOT NULL
+         AND claimant_session_incarnation_id IS NOT NULL
+         AND claimant_registration_fence IS NOT NULL)
+    ),
+    CHECK (
+        delivery_state NOT IN ('claimed', 'dispatching')
+        OR (claimant_session_uuid IS NOT NULL
+            AND claim_lease_token IS NOT NULL
+            AND claim_lease_expires_at IS NOT NULL)
+    )
+)
+"""
+
+_V4_DISPATCH_OWNERSHIP = """
+CREATE TABLE dispatch_ownership (
+    claim_lease_token                   TEXT NOT NULL PRIMARY KEY,
+    message_id                          TEXT NOT NULL,
+    target_session_uuid                 TEXT NOT NULL,
+    target_session_incarnation_id       TEXT NOT NULL,
+    claimant_session_uuid               TEXT NOT NULL,
+    claimant_session_incarnation_id     TEXT NOT NULL,
+    claimant_registration_fence         TEXT NOT NULL,
+    dispatch_started_at                 INTEGER NOT NULL,
+    FOREIGN KEY (message_id, target_session_uuid, target_session_incarnation_id)
+        REFERENCES targeted_deliveries(message_id, target_session_uuid, target_session_incarnation_id)
+)
+"""
+
+_V4_DISPATCH_OWNERSHIP_INDEX = """
+CREATE INDEX idx_dispatch_ownership_delivery
+    ON dispatch_ownership(message_id, target_session_uuid, target_session_incarnation_id)
+"""
+
+
+def _v4_quiescence_refusal_reason(db: sqlite3.Connection) -> Optional[str]:
+    """Return a refusal reason if any delivery is in a non-quiescent state, else None.
+
+    The caller MUST hold an open connection to the pre-migration DB. Runs
+    read-only; does not open a write transaction.
+    """
+    rows = db.execute(
+        "SELECT delivery_state, COUNT(*) AS n FROM targeted_deliveries"
+        " WHERE delivery_state IN ({})"
+        " GROUP BY delivery_state"
+        " ORDER BY delivery_state".format(",".join("?" * len(_V4_REFUSAL_STATES))),
+        _V4_REFUSAL_STATES,
+    ).fetchall()
+    if not rows:
+        return None
+    parts = [f"{r['delivery_state']}={r['n']}" for r in rows]
+    return (
+        "non-quiescent pre-migration state; v4 claimant-ownership refuses "
+        "to invent historical owners (" + ", ".join(parts) + ")"
+    )
+
+
+def _apply_v3_to_v4_migration(db_path: Path, *, now: int) -> None:
+    """Rebuild v3 → v4 under the SQLite FK PRAGMA discipline.
+
+    Caller MUST have closed its own connection first. This function opens its
+    own connection, toggles PRAGMA foreign_keys outside any transaction,
+    rebuilds targeted_deliveries to add the three nullable claimant_* columns
+    and the two new CHECK constraints, creates the dispatch_ownership witness
+    table and its lookup index, inserts the schema-version row, and restores
+    foreign_keys=ON in the finally block (preserving the primary exception if
+    one is in flight, mirroring the v2→v3 discipline).
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        if conn.in_transaction:
+            raise sqlite3.OperationalError(
+                "v3→v4 migration requires a non-active transaction"
+            )
+        conn.execute("PRAGMA foreign_keys = OFF")
+        fk_off = conn.execute("PRAGMA foreign_keys").fetchone()
+        if fk_off is None or fk_off[0] != 0:
+            raise sqlite3.OperationalError(
+                "PRAGMA foreign_keys=OFF could not be set before v3→v4 migration"
+            )
+
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+
+            delivery_count = conn.execute(
+                "SELECT COUNT(*) FROM targeted_deliveries"
+            ).fetchone()[0]
+
+            # Receipt triggers reference targeted_deliveries; drop them so the
+            # table rename below is not blocked by SQLite 3.25+ trigger-body
+            # validation. They are recreated verbatim after the rebuild — only
+            # the targeted_deliveries CREATE text changes between v3 and v4.
+            conn.execute("DROP TRIGGER IF EXISTS tr_receipt_marks_observed")
+            conn.execute("DROP TRIGGER IF EXISTS tr_receipt_requires_eligible_delivery_state")
+            conn.execute("DROP TRIGGER IF EXISTS tr_receipt_requires_live_registration")
+
+            # Rebuild targeted_deliveries with the new CHECK constraints and
+            # three nullable owner-tuple columns. Copy every v3 row verbatim,
+            # setting the three new columns to NULL (no owner invention).
+            conn.execute(_V4_REBUILT_TARGETED_DELIVERIES.replace(
+                "CREATE TABLE targeted_deliveries",
+                "CREATE TABLE _new_targeted_deliveries",
+            ))
+            conn.execute(
+                "INSERT INTO _new_targeted_deliveries ("
+                "  message_id, target_session_uuid, target_session_incarnation_id,"
+                "  sender_session_uuid, sender_session_incarnation_id,"
+                "  delivery_state, claim_lease_token, claim_lease_expires_at,"
+                "  dispatch_started_at, created_at, attempt_count,"
+                "  next_attempt_at, expires_at, last_error_class"
+                ") SELECT "
+                "  message_id, target_session_uuid, target_session_incarnation_id,"
+                "  sender_session_uuid, sender_session_incarnation_id,"
+                "  delivery_state, claim_lease_token, claim_lease_expires_at,"
+                "  dispatch_started_at, created_at, attempt_count,"
+                "  next_attempt_at, expires_at, last_error_class "
+                "FROM targeted_deliveries"
+            )
+            conn.execute("DROP TABLE targeted_deliveries")
+            conn.execute(
+                "ALTER TABLE _new_targeted_deliveries "
+                "RENAME TO targeted_deliveries"
+            )
+            conn.execute(
+                "CREATE INDEX idx_delivery_eligible "
+                "ON targeted_deliveries(next_attempt_at) "
+                "WHERE delivery_state = 'pending'"
+            )
+
+            copied = conn.execute(
+                "SELECT COUNT(*) FROM targeted_deliveries"
+            ).fetchone()[0]
+            if copied != delivery_count:
+                raise sqlite3.IntegrityError(
+                    "targeted_deliveries row count changed during v3→v4 "
+                    f"rebuild: expected {delivery_count}, copied {copied}"
+                )
+
+            # Create the new witness table + its lookup index. These artifacts
+            # do not exist in v3 so no rebuild is needed.
+            conn.execute(_V4_DISPATCH_OWNERSHIP)
+            conn.execute(_V4_DISPATCH_OWNERSHIP_INDEX)
+
+            # Recreate the receipt triggers verbatim (unchanged by v4).
+            conn.execute(_V3_TRIGGER_RECEIPT_REQUIRES_LIVE_REGISTRATION)
+            conn.execute(_V3_TRIGGER_RECEIPT_ELIGIBLE)
+            conn.execute(_V3_TRIGGER_RECEIPT_MARKS_OBSERVED)
+
+            fk_violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if fk_violations:
+                raise sqlite3.IntegrityError(
+                    f"foreign_key_check violations after v3→v4 rebuild: "
+                    f"{fk_violations!r}"
+                )
+
+            conn.execute(
+                "INSERT INTO awareness_schema_version "
+                "(version, applied_at, package_version) VALUES (?, ?, ?)",
+                (EXPECTED_SCHEMA_VERSION, now, PACKAGE_VERSION),
+            )
+
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+    finally:
+        import sys as _sys
+        primary_exc = _sys.exc_info()[0]
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            if primary_exc is None:
+                fk_on = conn.execute("PRAGMA foreign_keys").fetchone()
+                if fk_on is None or fk_on[0] != 1:
+                    raise sqlite3.OperationalError(
+                        "PRAGMA foreign_keys=ON could not be restored "
+                        "after v3→v4 migration"
                     )
         except sqlite3.Error:
             if primary_exc is None:
@@ -609,100 +879,128 @@ def apply(
             )
 
         if state["any_managed_present"]:
-            if (state["all_tables_present"] and state["all_indexes_present"]
-                    and state["all_triggers_present"]):
-                db.row_factory = sqlite3.Row
-                row = db.execute(
-                    "SELECT version FROM awareness_schema_version "
-                    "ORDER BY version DESC LIMIT 1"
-                ).fetchone()
-                installed_version = row["version"] if row is not None else None
-                if installed_version == EXPECTED_SCHEMA_VERSION:
-                    mismatch = _validate_sql_text_matches_canonical(state)
-                    if mismatch:
-                        return MigrationResult(
-                            status="partial_or_unknown_managed_state",
-                            reason=mismatch,
-                        )
+            # Read the installed version row FIRST: for a legacy schema
+            # version (v2 or v3) migrating up to v4, the state's
+            # all_tables_present check will be false (v4 adds the
+            # dispatch_ownership table + its index), but that is correct for
+            # the pre-migration state and must not be rejected as partial.
+            db.row_factory = sqlite3.Row
+            row = db.execute(
+                "SELECT version FROM awareness_schema_version "
+                "ORDER BY version DESC LIMIT 1"
+            ).fetchone()
+            installed_version = row["version"] if row is not None else None
+            if installed_version == EXPECTED_SCHEMA_VERSION:
+                if not (state["all_tables_present"]
+                        and state["all_indexes_present"]
+                        and state["all_triggers_present"]):
                     return MigrationResult(
-                        status="already_at_version",
-                        version=EXPECTED_SCHEMA_VERSION,
+                        status="partial_or_unknown_managed_state",
+                        reason=(
+                            f"schema at version {installed_version} but managed "
+                            f"artifacts incomplete: tables_missing="
+                            f"{sorted(MANAGED_TABLES - state['tables_present'])}, "
+                            f"indexes_missing={sorted(MANAGED_INDEXES - state['indexes_present'])}, "
+                            f"triggers_missing={sorted(MANAGED_TRIGGERS - state['triggers_present'])}"
+                        ),
                     )
-                if installed_version == 2 and EXPECTED_SCHEMA_VERSION == 3:
-                    # v2 → v3 upgrade path. Close the apply-owned connection
-                    # first: the migration must own PRAGMA foreign_keys toggles
-                    # outside any transaction, which requires exclusive access.
-                    if dry_run:
-                        return MigrationResult(
-                            status="applied",
-                            version=EXPECTED_SCHEMA_VERSION,
-                            reason="dry_run v2→v3",
-                        )
-                    backup = create_backup(
-                        db_path, backup_dir=backup_dir,
-                        expected_managed_artifacts=_expected_managed_set(),
-                        managed_namespace_names=_managed_namespace_names(),
-                        now=now,
+                mismatch = _validate_sql_text_matches_canonical(state)
+                if mismatch:
+                    return MigrationResult(
+                        status="partial_or_unknown_managed_state",
+                        reason=mismatch,
                     )
-                    db.close()
-                    try:
-                        _apply_v2_to_v3_migration(db_path, now=now)
-                    except sqlite3.Error as exc:
-                        return MigrationResult(
-                            status="failed",
-                            reason=f"v2→v3 migration failed: {exc}",
-                        )
-                    # Reopen for post-apply validation (mirrors fresh-install
-                    # path below).
-                    db = sqlite3.connect(str(db_path))
-                    db.execute("PRAGMA foreign_keys = ON")
-                    post_state = _collect_managed_state(db)
-                    if not (post_state["all_tables_present"]
-                            and post_state["all_indexes_present"]
-                            and post_state["all_triggers_present"]):
-                        return MigrationResult(
-                            status="failed",
-                            reason="post-migration: managed artifacts not all present",
-                        )
-                    mismatch = _validate_sql_text_matches_canonical(post_state)
-                    if mismatch:
-                        return MigrationResult(
-                            status="failed",
-                            reason=f"post-migration SQL mismatch: {mismatch}",
-                        )
-                    db.row_factory = sqlite3.Row
-                    row = db.execute(
-                        "SELECT version FROM awareness_schema_version "
-                        "WHERE version = ?",
-                        (EXPECTED_SCHEMA_VERSION,),
-                    ).fetchone()
-                    if row is None:
-                        return MigrationResult(
-                            status="failed",
-                            reason="post-migration: version row missing",
-                        )
+                return MigrationResult(
+                    status="already_at_version",
+                    version=EXPECTED_SCHEMA_VERSION,
+                )
+            if installed_version in (2, 3) and EXPECTED_SCHEMA_VERSION == 4:
+                # v2→v4 (chain: v2→v3→v4) or v3→v4 (single hop). Both are
+                # subject to the R9 quiescence refusal set BEFORE any backup or
+                # mutation. targeted_deliveries is present in both v2 and v3
+                # schemas with the same relevant column names, so the read-only
+                # quiescence check runs against the current state regardless of
+                # installed_version. For a v2 DB, 'dispatching' cannot be
+                # present (not a valid v2 state); the check still runs
+                # correctly because it uses an IN-list membership.
+                refusal = _v4_quiescence_refusal_reason(db)
+                if refusal is not None:
+                    return MigrationResult(
+                        status="refused",
+                        version=installed_version,
+                        reason=refusal,
+                    )
+                if dry_run:
+                    chain = ("v2→v3→v4" if installed_version == 2 else "v3→v4")
                     return MigrationResult(
                         status="applied",
                         version=EXPECTED_SCHEMA_VERSION,
-                        backup=backup,
-                        tables_created=tuple(sorted(MANAGED_TABLES)),
-                        indexes_created=tuple(sorted(MANAGED_INDEXES)),
-                        triggers_created=tuple(sorted(MANAGED_TRIGGERS)),
+                        reason=f"dry_run {chain}",
+                    )
+                backup = create_backup(
+                    db_path, backup_dir=backup_dir,
+                    # Pre-migration shape: v2 and v3 share the same
+                    # sqlite_master managed set (dispatch_ownership + its index
+                    # are v4-only), so the pre-v4 set verifies both.
+                    expected_managed_artifacts=_pre_v4_managed_set(),
+                    managed_namespace_names=_managed_namespace_names(),
+                    now=now,
+                )
+                db.close()
+                try:
+                    if installed_version == 2:
+                        _apply_v2_to_v3_migration(db_path, now=now)
+                    _apply_v3_to_v4_migration(db_path, now=now)
+                except sqlite3.Error as exc:
+                    return MigrationResult(
+                        status="failed",
+                        reason=(
+                            f"v{installed_version}→v{EXPECTED_SCHEMA_VERSION} "
+                            f"migration failed: {exc}"
+                        ),
+                    )
+                # Reopen for post-apply validation (mirrors fresh-install
+                # path below).
+                db = sqlite3.connect(str(db_path))
+                db.execute("PRAGMA foreign_keys = ON")
+                post_state = _collect_managed_state(db)
+                if not (post_state["all_tables_present"]
+                        and post_state["all_indexes_present"]
+                        and post_state["all_triggers_present"]):
+                    return MigrationResult(
+                        status="failed",
+                        reason="post-migration: managed artifacts not all present",
+                    )
+                mismatch = _validate_sql_text_matches_canonical(post_state)
+                if mismatch:
+                    return MigrationResult(
+                        status="failed",
+                        reason=f"post-migration SQL mismatch: {mismatch}",
+                    )
+                db.row_factory = sqlite3.Row
+                row = db.execute(
+                    "SELECT version FROM awareness_schema_version "
+                    "WHERE version = ?",
+                    (EXPECTED_SCHEMA_VERSION,),
+                ).fetchone()
+                if row is None:
+                    return MigrationResult(
+                        status="failed",
+                        reason="post-migration: version row missing",
                     )
                 return MigrationResult(
-                    status="partial_or_unknown_managed_state",
-                    reason=(
-                        f"schema at version {installed_version}, "
-                        f"expected {EXPECTED_SCHEMA_VERSION}"
-                    ),
+                    status="applied",
+                    version=EXPECTED_SCHEMA_VERSION,
+                    backup=backup,
+                    tables_created=tuple(sorted(MANAGED_TABLES)),
+                    indexes_created=tuple(sorted(MANAGED_INDEXES)),
+                    triggers_created=tuple(sorted(MANAGED_TRIGGERS)),
                 )
             return MigrationResult(
                 status="partial_or_unknown_managed_state",
                 reason=(
-                    f"partial managed state: tables_missing="
-                    f"{sorted(MANAGED_TABLES - state['tables_present'])}, "
-                    f"indexes_missing={sorted(MANAGED_INDEXES - state['indexes_present'])}, "
-                    f"triggers_missing={sorted(MANAGED_TRIGGERS - state['triggers_present'])}"
+                    f"schema at version {installed_version}, "
+                    f"expected {EXPECTED_SCHEMA_VERSION}"
                 ),
             )
 
@@ -767,9 +1065,11 @@ _DROP_ORDER = [
     ("trigger", "tr_receipt_requires_eligible_delivery_state"),
     ("trigger", "tr_receipt_requires_live_registration"),
     ("trigger", "tr_capability_verifier_length"),
+    ("index", "idx_dispatch_ownership_delivery"),
     ("index", "idx_delivery_eligible"),
     ("index", "idx_tool_state"),
     ("index", "idx_alias_live"),
+    ("table", "dispatch_ownership"),
     ("table", "disposition_receipts"),
     ("table", "queue_attempts"),
     ("table", "targeted_deliveries"),
@@ -819,6 +1119,33 @@ def rollback(
             return RollbackResult(
                 status="refused",
                 reason=f"{in_flight} in-flight deliveries; drive to terminal via reconciliation first",
+            )
+
+        # v0.5.0 (R4): refuse teardown when any dispatch_ownership witness has
+        # no matching targeted_deliveries row. Normally the FK prevents this,
+        # but a prior pathological state (e.g. FK-off repair) could leave
+        # orphaned witnesses; silently dropping them would discard the sole
+        # historical proof of a given lease_token's claimant.
+        unmatched_witness = (
+            db.execute(
+                "SELECT COUNT(*) FROM dispatch_ownership d"
+                " WHERE NOT EXISTS ("
+                "   SELECT 1 FROM targeted_deliveries t"
+                "   WHERE t.message_id = d.message_id"
+                "     AND t.target_session_uuid = d.target_session_uuid"
+                "     AND t.target_session_incarnation_id = d.target_session_incarnation_id"
+                " )"
+            ).fetchone()[0]
+            if _has_table(db, "dispatch_ownership") else 0
+        )
+        if unmatched_witness > 0:
+            return RollbackResult(
+                status="refused",
+                reason=(
+                    f"{unmatched_witness} dispatch_ownership witness rows have "
+                    "no matching delivery; manual review required (R4: no "
+                    "destructive teardown of unmatched witnesses)"
+                ),
             )
 
         live_caps = (

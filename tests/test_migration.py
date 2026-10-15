@@ -84,9 +84,14 @@ def test_rollback_refuses_on_in_flight_delivery(file_db_migrated, tmp_path):
             "INSERT INTO targeted_deliveries "
             "(message_id, target_session_uuid, target_session_incarnation_id, "
             " sender_session_uuid, sender_session_incarnation_id, delivery_state, "
+            " claim_lease_token, claim_lease_expires_at, "
+            " claimant_session_uuid, claimant_session_incarnation_id, "
+            " claimant_registration_fence, "
             " created_at, next_attempt_at, expires_at) "
-            "VALUES ('m1', ?, ?, ?, ?, 'claimed', 1, 1, 1_000_000)",
+            "VALUES ('m1', ?, ?, ?, ?, 'claimed', 'tok-r', 500, ?, ?, 'fence-r', "
+            " 1, 1, 1_000_000)",
             (str(_uuid.uuid4()), str(_uuid.uuid4()),
+             str(_uuid.uuid4()), str(_uuid.uuid4()),
              str(_uuid.uuid4()), str(_uuid.uuid4())),
         )
     result = rollback_migration(file_db_migrated, backup_dir=tmp_path / "backups5",
@@ -113,11 +118,14 @@ def test_rollback_refuses_on_dispatching_delivery(file_db_migrated, tmp_path):
             "INSERT INTO targeted_deliveries "
             "(message_id, target_session_uuid, target_session_incarnation_id, "
             " sender_session_uuid, sender_session_incarnation_id, delivery_state, "
-            " claim_lease_token, dispatch_started_at, "
+            " claim_lease_token, claim_lease_expires_at, dispatch_started_at, "
+            " claimant_session_uuid, claimant_session_incarnation_id, "
+            " claimant_registration_fence, "
             " created_at, next_attempt_at, expires_at) "
             "VALUES ('m-dispatching', ?, ?, ?, ?, 'dispatching', 'lease-xyz', "
-            " 1_000_050, 1, 1, 1_000_000)",
+            " 1_000_200, 1_000_050, ?, ?, 'fence-d', 1, 1, 1_000_000)",
             (str(_uuid.uuid4()), str(_uuid.uuid4()),
+             str(_uuid.uuid4()), str(_uuid.uuid4()),
              str(_uuid.uuid4()), str(_uuid.uuid4())),
         )
     result = rollback_migration(file_db_migrated,
