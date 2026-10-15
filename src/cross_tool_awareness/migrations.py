@@ -290,19 +290,25 @@ def _canonical_sql_by_name_for(version: int) -> dict[str, str]:
 def _collect_managed_state(db: sqlite3.Connection) -> dict:
     """Return the set of managed-namespace artifacts actually present + their SQL."""
     rows = db.execute(
-        "SELECT type, name, sql FROM sqlite_master "
+        "SELECT type, name, sql, tbl_name FROM sqlite_master "
         "WHERE type IN ('table', 'index', 'trigger') "
         "  AND name NOT LIKE 'sqlite_%'"
     ).fetchall()
-    tables = {n for t, n, _ in rows if t == "table" and n in MANAGED_TABLES}
-    indexes = {n for t, n, _ in rows if t == "index" and n in MANAGED_INDEXES}
-    triggers = {n for t, n, _ in rows if t == "trigger" and n in MANAGED_TRIGGERS}
-    sql_by_name = {n: s for _, n, s in rows}
+    tables = {n for t, n, _, _ in rows if t == "table" and n in MANAGED_TABLES}
+    indexes = {n for t, n, _, _ in rows if t == "index" and n in MANAGED_INDEXES}
+    triggers = {n for t, n, _, _ in rows if t == "trigger" and n in MANAGED_TRIGGERS}
+    sql_by_name = {n: s for _, n, s, _ in rows}
     # Extras: anything whose name matches an awareness-namespace prefix but
     # isn't in a MANAGED_* set.
     extras = set()
-    for t, n, _ in rows:
+    for t, n, _, table in rows:
         if n in MANAGED_TABLES or n in MANAGED_INDEXES or n in MANAGED_TRIGGERS:
+            continue
+        # DROP TABLE destroys its indexes/triggers regardless of their names.
+        # Refuse unfamiliar behavior attached to a table we manage; unrelated
+        # bridge-table objects remain outside the package's ownership.
+        if t in ("index", "trigger") and table in MANAGED_TABLES:
+            extras.add((t, n))
             continue
         for pfx in _MANAGED_PREFIXES:
             if n.startswith(pfx):
