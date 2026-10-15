@@ -273,54 +273,5 @@ def test_claim_delivery_rejects_stale_snapshot(tmp_path):
     assert claim is None
 
 
-# --- Rollback on exception preserves state ---------------------------------
-
-
-def test_claim_delivery_rollback_on_sql_exception(tmp_path, monkeypatch):
-    """An exception inside the BEGIN IMMEDIATE block must leave zero writes."""
-    db = _fresh_db(tmp_path)
-    cid = _make_identity()
-    _register(db, cid)
-    target = _make_identity(fence="target-f")
-    _register(db, target, holder_pid=5678, process_started_at=2_000_000)
-    _seed_pending_delivery(db, target, now=10)
-
-    original_execute = db.execute
-    call_count = {"n": 0}
-
-    def failing_execute(sql, *args, **kwargs):
-        call_count["n"] += 1
-        # Fail on the second UPDATE (claim-stamp) only
-        if call_count["n"] == 6 and "UPDATE targeted_deliveries" in sql:
-            raise sqlite3.OperationalError("synthetic failure")
-        return original_execute(sql, *args, **kwargs)
-
-    # Rather than patching execute (fragile), just verify the happy path
-    # commits and the error path (bad schema) doesn't leave garbage.
-    # Skip the synthetic injection and verify end-to-end: a claim followed by
-    # a mark with wrong snapshot (fails) leaves state consistent.
-    claim = claim_delivery(db, now=10, claimant=cid, clock=lambda: 10,
-                           claimant_snapshot=_snapshot(cid),
-                           tool="claude", wake_capability="notify_only")
-    assert claim is not None
-    # Mark with stale target snapshot — must fail
-    ok = pre_adapter_mark(
-        db, message_id=claim.message_id,
-        target_session_uuid=claim.target_session_uuid,
-        target_session_incarnation_id=claim.target_session_incarnation_id,
-        lease_token=claim.claim_lease_token, now=10,
-        claimant=cid, clock=lambda: 1000,  # 1000s - 10s obs = 990s stale
-        claimant_snapshot=_snapshot(cid, proof_observed_at=10),
-        target_snapshot=_snapshot(cid, proof_observed_at=10),
-        tool="claude", wake_capability="notify_only",
-    )
-    assert ok is False
-    # No witness written
-    witness = db.execute("SELECT COUNT(*) FROM dispatch_ownership").fetchone()
-    assert witness[0] == 0
-    # Delivery still claimed, not dispatching
-    state = db.execute(
-        "SELECT delivery_state FROM targeted_deliveries WHERE message_id = ?",
-        (claim.message_id,),
-    ).fetchone()
-    assert state[0] == "claimed"
+# Rollback-on-exception coverage for every writer (with real failure
+# injection, BaseException included) lives in tests/test_writer_rollback.py.

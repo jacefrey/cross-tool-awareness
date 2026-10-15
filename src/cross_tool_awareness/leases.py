@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 from uuid import UUID
 
+from ._txn import immediate
 from .contracts import ClaimantIdentity, RegistrationSnapshot
 
 
@@ -243,28 +244,18 @@ def claim_delivery(
     gate on the writer; see composite_storage for the full facade.
     """
     _assert_no_active_transaction(db)
-    completion_now = int(clock())
-    freshness = _check_snapshot_freshness(completion_now, claimant_snapshot,
-                                          label="claimant")
-    if freshness is not None:
-        return None
-    db.execute("BEGIN IMMEDIATE")
-    try:
-        if not _claimant_live_in_sql(db, claimant, now=completion_now):
-            db.execute("ROLLBACK")
+    with immediate(db):
+        completion_now = int(clock())
+        freshness = _check_snapshot_freshness(completion_now, claimant_snapshot,
+                                              label="claimant")
+        if freshness is not None:
             return None
-        result = _claim_delivery_in_transaction(
+        if not _claimant_live_in_sql(db, claimant, now=completion_now):
+            return None
+        return _claim_delivery_in_transaction(
             db, now=now, lease_ttl_seconds=lease_ttl_seconds,
             claimant=claimant, tool=tool, wake_capability=wake_capability,
         )
-        db.execute("COMMIT")
-        return result
-    except Exception:
-        try:
-            db.execute("ROLLBACK")
-        except sqlite3.Error:
-            pass
-        raise
 
 
 def _claim_delivery_in_transaction(
@@ -365,17 +356,15 @@ def pre_adapter_mark(
     insert is impossible.
     """
     _assert_no_active_transaction(db)
-    completion_now = int(clock())
-    if _check_snapshot_freshness(completion_now, claimant_snapshot,
-                                 label="claimant") is not None:
-        return False
-    if _check_snapshot_freshness(completion_now, target_snapshot,
-                                 label="target") is not None:
-        return False
-    db.execute("BEGIN IMMEDIATE")
-    try:
+    with immediate(db):
+        completion_now = int(clock())
+        if _check_snapshot_freshness(completion_now, claimant_snapshot,
+                                     label="claimant") is not None:
+            return False
+        if _check_snapshot_freshness(completion_now, target_snapshot,
+                                     label="target") is not None:
+            return False
         if not _claimant_live_in_sql(db, claimant, now=completion_now):
-            db.execute("ROLLBACK")
             return False
         # Verify the target is still a live registration matching the
         # target_snapshot's PID/started_at. target_snapshot is already
@@ -390,7 +379,6 @@ def pre_adapter_mark(
              completion_now),
         ).fetchone()
         if target_live is None:
-            db.execute("ROLLBACK")
             return False
         # Exact-owner UPDATE: wrong claimant, wrong token, or wrong key
         # changes zero rows.
@@ -417,7 +405,6 @@ def pre_adapter_mark(
             ),
         )
         if cursor.rowcount != 1:
-            db.execute("ROLLBACK")
             return False
         # Insert the witness inside the SAME transaction (R4). PRIMARY KEY on
         # claim_lease_token means a duplicate here is a fatal programming
@@ -435,14 +422,7 @@ def pre_adapter_mark(
              str(claimant.session_incarnation_id),
              claimant.registration_fence, completion_now),
         )
-        db.execute("COMMIT")
         return True
-    except Exception:
-        try:
-            db.execute("ROLLBACK")
-        except sqlite3.Error:
-            pass
-        raise
 
 
 def list_stuck_dispatching(
@@ -516,8 +496,7 @@ def pre_adapter_release(
     assert next_state in ("pending", "blocked"), f"invalid pre-adapter next_state {next_state!r}"
     _assert_no_active_transaction(db)
     _ = int(clock())  # kwarg consumed for API-shape consistency; not read here
-    db.execute("BEGIN IMMEDIATE")
-    try:
+    with immediate(db):
         cur = db.execute(
             "UPDATE targeted_deliveries "
             "SET delivery_state = ?, claim_lease_token = NULL, "
@@ -543,15 +522,7 @@ def pre_adapter_release(
              claimant.registration_fence),
         )
         if cur.rowcount == 0:
-            db.execute("ROLLBACK")
             return PreAdapterReleaseResult(status="lease_released_or_observed")
-        db.execute("COMMIT")
-    except Exception:
-        try:
-            db.execute("ROLLBACK")
-        except sqlite3.Error:
-            pass
-        raise
     return PreAdapterReleaseResult(status="released", diagnostic=diagnostic)
 
 
@@ -595,8 +566,7 @@ def finalize_attempt(
     new_state = _OUTCOME_TO_STATE[outcome]
     _assert_no_active_transaction(db)
     _ = int(clock())  # kwarg consumed for API-shape consistency
-    db.execute("BEGIN IMMEDIATE")
-    try:
+    with immediate(db):
         # Authenticate against the durable witness. Exact owner + token + key
         # required; wrong anything → zero rows → unauthorized.
         witness = db.execute(
@@ -614,7 +584,6 @@ def finalize_attempt(
              claimant.registration_fence),
         ).fetchone()
         if witness is None:
-            db.execute("ROLLBACK")
             return FinalizationResult(status="unauthorized",
                                       attempt_recorded=False)
 
@@ -632,7 +601,6 @@ def finalize_attempt(
             )
         except sqlite3.IntegrityError as e:
             if "UNIQUE constraint failed: queue_attempts.claim_lease_token" in str(e):
-                db.execute("ROLLBACK")
                 return FinalizationResult(status="already_finalized",
                                           attempt_recorded=False)
             raise
@@ -672,7 +640,6 @@ def finalize_attempt(
                  str(target_session_incarnation_id)),
             ).fetchone()
             current_state = current_state_row[0] if current_state_row else None
-            db.execute("COMMIT")
             if current_state == "observed":
                 return FinalizationResult(
                     status="receipt_already_won",
@@ -682,14 +649,6 @@ def finalize_attempt(
                 status="lease_already_released",
                 attempt_recorded=True,
             )
-
-        db.execute("COMMIT")
-    except Exception:
-        try:
-            db.execute("ROLLBACK")
-        except sqlite3.Error:
-            pass
-        raise
 
     return FinalizationResult(
         status="finalized",
