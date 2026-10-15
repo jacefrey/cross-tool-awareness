@@ -10,10 +10,12 @@ import cross_tool_awareness as awareness
 import pytest
 
 from cross_tool_awareness import (
+    ClaimantIdentity,
     Disposition,
     DispositionReceipt,
     NoticeKey,
     ReceiptStorage,
+    RegistrationSnapshot,
     claim_delivery,
     finalize_attempt,
     pre_adapter_mark,
@@ -35,6 +37,9 @@ def _register(db, presence):
 
 
 def _dispatching(db, make_presence_fn, *, message_id=None, started_at=1_000_100):
+    # v0.5.0: the target itself acts as its own claimant for stuck-dispatching
+    # fixtures — the point of these tests is the DISPATCHING-state inspection
+    # surface, not owner identity. Use the target's identity as claimant.
     presence = make_presence_fn()
     _register(db, presence)
     message_id = message_id or uuid4()
@@ -56,8 +61,26 @@ def _dispatching(db, make_presence_fn, *, message_id=None, started_at=1_000_100)
             2_000_000,
         ),
     )
-    claim = claim_delivery(db, now=1_000_010, lease_ttl_seconds=5)
+    db.commit()
+    cid = ClaimantIdentity(session_uuid=presence.session_uuid,
+                           session_incarnation_id=presence.session_incarnation_id,
+                           registration_fence=presence.registration_fence)
+    snap = RegistrationSnapshot(
+        presence=presence, holder_pid=12_345,
+        process_started_at=presence.started_at,
+        proof_observed_at=started_at,
+    )
+    # v0.5.0: pre_adapter_mark now re-verifies lease_expires_at > now, so the
+    # fixture must give the lease enough runway to still be live at
+    # started_at.
+    claim = claim_delivery(
+        db, now=1_000_010, lease_ttl_seconds=500,
+        claimant=cid, clock=lambda: started_at,
+        claimant_snapshot=snap,
+        tool=presence.tool, wake_capability=presence.wake_capability,
+    )
     assert claim is not None
+    db.commit()
     assert pre_adapter_mark(
         db,
         message_id=claim.message_id,
@@ -65,6 +88,9 @@ def _dispatching(db, make_presence_fn, *, message_id=None, started_at=1_000_100)
         target_session_incarnation_id=claim.target_session_incarnation_id,
         lease_token=claim.claim_lease_token,
         now=started_at,
+        claimant=cid, clock=lambda: started_at,
+        claimant_snapshot=snap, target_snapshot=snap,
+        tool=presence.tool, wake_capability=presence.wake_capability,
     )
     return presence, claim
 
@@ -149,8 +175,14 @@ def test_matching_receipt_reconciles_dispatching_to_observed(db, make_presence_f
 def test_same_token_finalization_reconciles_dispatching_to_proven_outcome(
     db, make_presence_fn
 ):
-    _, claim = _dispatching(db, make_presence_fn)
+    presence, claim = _dispatching(db, make_presence_fn)
+    cid = ClaimantIdentity(
+        session_uuid=presence.session_uuid,
+        session_incarnation_id=presence.session_incarnation_id,
+        registration_fence=presence.registration_fence,
+    )
 
+    db.commit()
     result = finalize_attempt(
         db,
         claim_lease_token=claim.claim_lease_token,
@@ -162,6 +194,8 @@ def test_same_token_finalization_reconciles_dispatching_to_proven_outcome(
         attempted_at=1_000_100,
         now=1_000_101,
         next_attempt_at=1_000_200,
+        claimant=cid,
+        clock=lambda: 1_000_101,
     )
 
     assert result.status == "finalized"

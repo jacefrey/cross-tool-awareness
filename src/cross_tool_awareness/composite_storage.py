@@ -1,36 +1,50 @@
-"""Composite-shaped adapter over the package's SQLite primitives."""
+"""Composite-shaped adapter over the package's SQLite primitives.
+
+v0.5.0 (design R5): the facade binds an immutable ``ClaimantIdentity`` and
+an injected ``clock`` at construction. Both travel through every write
+call to the package. The facade cannot refresh its claimant in place —
+after a trusted re-registration or fence change, owner wiring must
+construct a NEW facade from a newly verified binding. The old facade
+cannot claim or mark under its stale identity; its already-entered
+attempt may still finalize against its exact durable dispatch_ownership
+witness (authentication done by leases.finalize_attempt).
+"""
 
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Callable
 
-from ._txn import immediate
 from .contracts import (
+    ClaimantIdentity,
     DispositionReceipt,
     PresenceRecord,
     QueueAttempt,
+    RegistrationSnapshot,
 )
 from .leases import (
     ClaimedDelivery,
-    _claim_delivery_in_transaction,
+    claim_delivery as _claim_delivery,
     finalize_attempt as _finalize_attempt,
     pre_adapter_mark as _pre_adapter_mark,
+    pre_adapter_release as _pre_adapter_release,
 )
 
 
 @dataclass(frozen=True, init=False)
 class CompositeStorage:
-    """Exact six-method storage facade for the foreground composite.
+    """Owner-aware storage facade for the foreground composite.
 
-    Routing is bound once at construction. Every write is fenced by the full
-    delivery key, current state, and caller-supplied lease token.
+    Routing (tool + wake_capability) and owner identity (claimant) are both
+    bound once at construction and immutable for the facade's lifetime.
     """
 
     _db: sqlite3.Connection
     tool: str
     wake_capability: str
-    _claim_fences: dict[str, str] = field(repr=False, compare=False)
+    claimant: ClaimantIdentity
+    _clock: Callable[[], int]
 
     def __init__(
         self,
@@ -38,18 +52,26 @@ class CompositeStorage:
         *,
         tool: str,
         wake_capability: str,
+        claimant: ClaimantIdentity,
+        clock: Callable[[], int],
     ) -> None:
         if not isinstance(tool, str) or not tool:
             raise ValueError("tool must be a nonempty string")
         if not isinstance(wake_capability, str) or not wake_capability:
             raise ValueError("wake_capability must be a nonempty string")
+        if not isinstance(claimant, ClaimantIdentity):
+            raise TypeError("claimant must be a ClaimantIdentity")
+        if not callable(clock):
+            raise TypeError("clock must be callable")
         object.__setattr__(self, "_db", db)
         object.__setattr__(self, "tool", tool)
         object.__setattr__(self, "wake_capability", wake_capability)
-        object.__setattr__(self, "_claim_fences", {})
+        object.__setattr__(self, "claimant", claimant)
+        object.__setattr__(self, "_clock", clock)
         db.row_factory = sqlite3.Row
 
     def pending_count(self, now: int) -> int:
+        """Read-only due-pending count. Ownership-neutral."""
         row = self._db.execute(
             "SELECT COUNT(*) FROM targeted_deliveries "
             "WHERE delivery_state = 'pending' AND next_attempt_at <= ?",
@@ -62,6 +84,7 @@ class CompositeStorage:
         now: int,
         *,
         recovery_after: int,
+        claimant_snapshot: RegistrationSnapshot,
     ) -> ClaimedDelivery | None:
         if (
             isinstance(recovery_after, bool)
@@ -69,33 +92,16 @@ class CompositeStorage:
             or recovery_after <= 0
         ):
             raise ValueError("recovery_after must be a positive int")
-        # The package claim primitive is an atomic entry point and has always
-        # committed an in-flight implicit transaction before claiming. Keep
-        # that public behavior, then bind the claim and registration fence in
-        # one new write transaction below.
-        if self._db.in_transaction:
-            self._db.commit()
-        fence = None
-        with immediate(self._db):
-            claim = _claim_delivery_in_transaction(
-                self._db,
-                now=now,
-                lease_ttl_seconds=recovery_after,
-            )
-            if claim is not None:
-                row = self._db.execute(
-                    "SELECT registration_fence FROM session_registrations "
-                    "WHERE session_uuid = ? AND session_incarnation_id = ?",
-                    (
-                        str(claim.target_session_uuid),
-                        str(claim.target_session_incarnation_id),
-                    ),
-                ).fetchone()
-                if row is not None:
-                    fence = row[0]
-        if claim is not None and fence is not None:
-            self._claim_fences[claim.claim_lease_token] = fence
-        return claim
+        return _claim_delivery(
+            self._db,
+            now=now,
+            lease_ttl_seconds=recovery_after,
+            claimant=self.claimant,
+            clock=self._clock,
+            claimant_snapshot=claimant_snapshot,
+            tool=self.tool,
+            wake_capability=self.wake_capability,
+        )
 
     def revalidate_claim(
         self,
@@ -104,9 +110,15 @@ class CompositeStorage:
         *,
         lease_token: str,
     ) -> PresenceRecord | None:
-        expected_fence = self._claim_fences.get(lease_token)
-        if expected_fence is None:
-            return None
+        """Return the current PresenceRecord for the claim's target, iff:
+
+        - this claim's lease is still live under this facade's claimant,
+        - the target registration is still live and matches the claim's
+          captured target fence,
+        - routing still matches the facade's (tool, wake_capability).
+
+        Zero rows → None (caller should release). This is read-only.
+        """
         row = self._db.execute(
             "SELECT r.* FROM session_registrations AS r "
             "JOIN targeted_deliveries AS d "
@@ -118,8 +130,10 @@ class CompositeStorage:
             "  AND d.delivery_state = 'claimed' "
             "  AND d.claim_lease_token = ? "
             "  AND d.claim_lease_expires_at > ? "
+            "  AND d.claimant_session_uuid = ? "
+            "  AND d.claimant_session_incarnation_id = ? "
+            "  AND d.claimant_registration_fence = ? "
             "  AND r.revoked_at IS NULL AND r.expires_at > ? "
-            "  AND r.registration_fence = ? "
             "  AND r.state IN ('active', 'busy', 'idle') "
             "  AND r.tool = ? AND r.wake_capability = ?",
             (
@@ -128,8 +142,10 @@ class CompositeStorage:
                 str(claim.target_session_incarnation_id),
                 lease_token,
                 int(now),
+                str(self.claimant.session_uuid),
+                str(self.claimant.session_incarnation_id),
+                self.claimant.registration_fence,
                 int(now),
-                expected_fence,
                 self.tool,
                 self.wake_capability,
             ),
@@ -146,31 +162,28 @@ class CompositeStorage:
         *,
         lease_token: str,
     ) -> None:
+        """Release before adapter entry. Raises RuntimeError if the claim's
+        lease was lost (concurrent recovery, wrong owner, etc.)."""
         if state not in {"pending", "blocked"}:
             raise ValueError("state must be pending or blocked")
         if not isinstance(reason, str) or not reason:
             raise ValueError("reason must be a nonempty string")
-        with self._db:
-            cursor = self._db.execute(
-                "UPDATE targeted_deliveries "
-                "SET delivery_state = ?, claim_lease_token = NULL, "
-                "    claim_lease_expires_at = NULL, last_error_class = ? "
-                "WHERE message_id = ? AND target_session_uuid = ? "
-                "  AND target_session_incarnation_id = ? "
-                "  AND delivery_state = 'claimed' "
-                "  AND claim_lease_token = ?",
-                (
-                    state,
-                    reason,
-                    str(claim.message_id),
-                    str(claim.target_session_uuid),
-                    str(claim.target_session_incarnation_id),
-                    lease_token,
-                ),
+        result = _pre_adapter_release(
+            self._db,
+            claim_lease_token=lease_token,
+            next_state=state,
+            diagnostic=reason,
+            next_attempt_at=int(self._clock()),
+            claimant=self.claimant,
+            clock=self._clock,
+            message_id=claim.message_id,
+            target_session_uuid=claim.target_session_uuid,
+            target_session_incarnation_id=claim.target_session_incarnation_id,
+        )
+        if result.status != "released":
+            raise RuntimeError(
+                f"claim lease lost before release: {result.status}"
             )
-            if cursor.rowcount != 1:
-                raise RuntimeError("claim lease lost before release")
-        self._claim_fences.pop(lease_token, None)
 
     def pre_adapter_mark(
         self,
@@ -178,7 +191,13 @@ class CompositeStorage:
         now: int,
         *,
         lease_token: str,
+        claimant_snapshot: RegistrationSnapshot,
+        target_snapshot: RegistrationSnapshot,
     ) -> bool:
+        """Mark the exact owned claim as dispatching AND write the
+        dispatch_ownership witness, atomically. False gates the caller from
+        invoking the adapter.
+        """
         return _pre_adapter_mark(
             self._db,
             message_id=claim.message_id,
@@ -186,6 +205,12 @@ class CompositeStorage:
             target_session_incarnation_id=claim.target_session_incarnation_id,
             lease_token=lease_token,
             now=now,
+            claimant=self.claimant,
+            clock=self._clock,
+            claimant_snapshot=claimant_snapshot,
+            target_snapshot=target_snapshot,
+            tool=self.tool,
+            wake_capability=self.wake_capability,
         )
 
     def finalize_attempt(
@@ -216,8 +241,9 @@ class CompositeStorage:
             attempted_at=attempt.attempted_at,
             now=attempt.finished_at,
             next_attempt_at=attempt.finished_at,
+            claimant=self.claimant,
+            clock=self._clock,
         )
-        self._claim_fences.pop(lease_token, None)
         if result.status != "receipt_already_won":
             return None
         row = self._db.execute(

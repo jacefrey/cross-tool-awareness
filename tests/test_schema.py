@@ -25,15 +25,30 @@ def _u() -> str:
 def _insert_delivery(db, *, message_id, target_uuid, target_incarnation,
                      delivery_state="pending", now=1_000_100,
                      expires_at=1_000_000 + 3600):
+    # v0.5.0 (schema v4): claimed/dispatching rows require full owner tuple +
+    # claim_lease_token + claim_lease_expires_at per the CHECK constraint.
+    # Supply synthetic owner values for those states so legacy tests that
+    # only care about state transitions still exercise the schema honestly.
+    needs_owner = delivery_state in ("claimed", "dispatching")
+    token = f"tok-{_u()[:8]}" if needs_owner else None
+    lease_exp = now + 300 if needs_owner else None
+    owner_u = _u() if needs_owner else None
+    owner_i = _u() if needs_owner else None
+    owner_f = f"fence-{_u()[:8]}" if needs_owner else None
     db.execute("INSERT OR IGNORE INTO messages (id) VALUES (?)", (message_id,))
     db.execute(
         "INSERT INTO targeted_deliveries "
         "(message_id, target_session_uuid, target_session_incarnation_id, "
         " sender_session_uuid, sender_session_incarnation_id, delivery_state, "
+        " claim_lease_token, claim_lease_expires_at, "
+        " claimant_session_uuid, claimant_session_incarnation_id, "
+        " claimant_registration_fence, "
         " created_at, next_attempt_at, expires_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (message_id, target_uuid, target_incarnation,
-         _u(), _u(), delivery_state, now, now, expires_at),
+         _u(), _u(), delivery_state,
+         token, lease_exp, owner_u, owner_i, owner_f,
+         now, now, expires_at),
     )
 
 
@@ -258,24 +273,72 @@ def test_tr_receipt_marks_observed_clears_claim_lease(db, msg):
 
 
 def test_blocked_then_reconcile_retry_claim_notified_receipt_lands(db, msg):
-    from cross_tool_awareness.leases import claim_delivery, finalize_attempt
+    from uuid import UUID, uuid4
+    from cross_tool_awareness import (
+        ClaimantIdentity, PresenceRecord, RegistrationSnapshot,
+    )
+    from cross_tool_awareness.leases import (
+        claim_delivery, pre_adapter_mark, finalize_attempt,
+    )
     from cross_tool_awareness.reconciliation import reconcile_blocked
 
+    # v0.5.0: this test needs an owner-aware session that owns the claim.
+    # Reuse the receiver session as the claimant (it's the only live one here).
+    sid_s = _u()
+    inc_s = _u()
+    claimant_uuid = UUID(sid_s)
+    claimant_inc = UUID(inc_s)
+    _insert_registration(db, session_uuid=sid_s, session_incarnation=inc_s,
+                         holder_pid=4242, started_at=1_000_000,
+                         heartbeat_at=1_000_100, expires_at=1_000_000 + 86400)
+    presence = PresenceRecord(
+        session_uuid=claimant_uuid, session_incarnation_id=claimant_inc,
+        alias=f"alias-{sid_s[:8]}", tool="codex", project_slug="p",
+        project_root="/tmp/p", role="manager", state="idle",
+        wake_capability="codex_queue", registration_fence="f",
+        wake_locator="l", started_at=1_000_000, heartbeat_at=1_000_100,
+        expires_at=1_000_000 + 86400,
+    )
+    cid = ClaimantIdentity(session_uuid=claimant_uuid,
+                           session_incarnation_id=claimant_inc,
+                           registration_fence="f")
+    snap = RegistrationSnapshot(presence=presence, holder_pid=4242,
+                                process_started_at=1_000_000,
+                                proof_observed_at=1_000_300)
+
     mid = msg()
-    sid, inc = _insert_registration(db)
-    _insert_delivery(db, message_id=mid, target_uuid=sid, target_incarnation=inc,
+    _insert_delivery(db, message_id=mid, target_uuid=sid_s, target_incarnation=inc_s,
                      delivery_state="blocked", now=1_000_100)
 
-    # Earlier blocked-state receipt attempt would be rejected (verified separately).
-    # Reconcile → pending → claim → finalize accepted → notified → receipt → observed.
-    r = reconcile_blocked(db, message_id=mid, target_session_uuid=sid,
-                          target_session_incarnation_id=inc,
+    r = reconcile_blocked(db, message_id=mid, target_session_uuid=sid_s,
+                          target_session_incarnation_id=inc_s,
                           outcome="retry", now=1_000_200)
     assert r.status == "reconciled"
 
-    claim = claim_delivery(db, now=1_000_300)
+    # Commit any pending auto-txn so the owner-aware entry points can own
+    # their BEGIN IMMEDIATE without hitting _assert_no_active_transaction.
+    db.commit()
+
+    claim = claim_delivery(
+        db, now=1_000_300, claimant=cid, clock=lambda: 1_000_300,
+        claimant_snapshot=snap, tool="codex", wake_capability="codex_queue",
+    )
     assert claim is not None
 
+    # Mark dispatching + write witness so finalize_attempt can authenticate.
+    db.commit()
+    ok = pre_adapter_mark(
+        db, message_id=claim.message_id,
+        target_session_uuid=claim.target_session_uuid,
+        target_session_incarnation_id=claim.target_session_incarnation_id,
+        lease_token=claim.claim_lease_token, now=1_000_300,
+        claimant=cid, clock=lambda: 1_000_300,
+        claimant_snapshot=snap, target_snapshot=snap,
+        tool="codex", wake_capability="codex_queue",
+    )
+    assert ok
+
+    db.commit()
     final = finalize_attempt(
         db, claim_lease_token=claim.claim_lease_token,
         message_id=claim.message_id,
@@ -283,6 +346,7 @@ def test_blocked_then_reconcile_retry_claim_notified_receipt_lands(db, msg):
         target_session_incarnation_id=claim.target_session_incarnation_id,
         outcome="accepted_by_cli", reason="",
         attempted_at=1_000_300, now=1_000_301, next_attempt_at=1_000_600,
+        claimant=cid, clock=lambda: 1_000_301,
     )
     assert final.status == "finalized"
     assert final.new_state == "notified"
@@ -293,7 +357,7 @@ def test_blocked_then_reconcile_retry_claim_notified_receipt_lands(db, msg):
         " correlation_id, consumer_id, receiver_session_uuid, "
         " receiver_session_incarnation_id, disposition, observed_at, reason, "
         " delivered_at) VALUES (?, ?, ?, ?, 'c', ?, ?, 'accepted', 1_000_400, '', 1_000_400)",
-        (mid, sid, inc, _u(), sid, inc),
+        (mid, sid_s, inc_s, _u(), sid_s, inc_s),
     )
     row = db.execute(
         "SELECT delivery_state FROM targeted_deliveries WHERE message_id=?",

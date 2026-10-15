@@ -202,15 +202,23 @@ def test_record_first_disposition_two_connection_race_deterministic(shared_db):
         "INSERT INTO messages (id, payload, created_at) VALUES (?, '', ?)",
         (str(msg_id), 1_000_000),
     )
+    # v0.5.0: schema v4 CHECK requires claimed/dispatching rows to carry a
+    # full owner tuple + claim_lease_token + claim_lease_expires_at.
     conn_setup.execute(
         "INSERT INTO targeted_deliveries "
         "(message_id, target_session_uuid, target_session_incarnation_id,"
         " sender_session_uuid, sender_session_incarnation_id, delivery_state,"
+        " claim_lease_token, claim_lease_expires_at,"
+        " claimant_session_uuid, claimant_session_incarnation_id,"
+        " claimant_registration_fence,"
         " created_at, next_attempt_at, expires_at) "
-        "VALUES (?, ?, ?, ?, ?, 'claimed', ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, 'claimed', 'tok-conc', ?, ?, ?, 'fence-conc',"
+        " ?, ?, ?)",
         (str(msg_id),
          str(target.session_uuid), str(target.session_incarnation_id),
          str(target.session_uuid), str(target.session_incarnation_id),
+         1_000_100,
+         str(_uuid.uuid4()), str(_uuid.uuid4()),
          1_000_010, 1_000_010, 1_000_000 + 86400),
     )
     conn_setup.commit()

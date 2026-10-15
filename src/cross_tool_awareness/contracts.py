@@ -367,3 +367,89 @@ def validate_notice_summary(text):
     if any(label in lowered for label in _CREDENTIAL_LABELS):
         return SUMMARY_OMITTED
     return text
+
+
+# v0.5.0 claimant ownership (design R5) ------------------------------------
+
+
+@dataclass(frozen=True)
+class ClaimantIdentity:
+    """Immutable owner identity bound to a facade for its lifetime.
+
+    Owner identity is distinct from sender and target. A ClaimantIdentity is
+    constructed from a trusted re-registration binding by the owner's wiring
+    and threaded through every CompositeStorage facade. The facade cannot
+    refresh its ClaimantIdentity in place; after a fence change or re-
+    registration, owner wiring must construct a NEW facade from the newly
+    verified binding. An already-entered attempt from the old facade may
+    still finalize against its exact durable witness (see dispatch_ownership
+    table + leases.finalize_attempt).
+    """
+
+    session_uuid: UUID
+    session_incarnation_id: UUID
+    registration_fence: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.session_uuid, UUID):
+            raise TypeError(
+                f"ClaimantIdentity.session_uuid must be uuid.UUID, "
+                f"got {type(self.session_uuid).__name__}"
+            )
+        if not isinstance(self.session_incarnation_id, UUID):
+            raise TypeError(
+                f"ClaimantIdentity.session_incarnation_id must be uuid.UUID, "
+                f"got {type(self.session_incarnation_id).__name__}"
+            )
+        if not isinstance(self.registration_fence, str):
+            raise TypeError(
+                "ClaimantIdentity.registration_fence must be str, "
+                f"got {type(self.registration_fence).__name__}"
+            )
+        if not self.registration_fence:
+            raise ValueError(
+                "ClaimantIdentity.registration_fence must be nonempty"
+            )
+
+
+@dataclass(frozen=True)
+class RegistrationSnapshot:
+    """A positive OS observation of a trusted registration's liveness.
+
+    Issued by owner-controlled wiring after a positive OS observation of its
+    durable PID/start pair. Supplied to leases.pre_adapter_mark /
+    claim_delivery, where the package compares it against the SQL
+    session_registrations row and the +/- 30 s freshness window
+    (0 <= clock_now - proof_observed_at <= 30, design R7) at write time.
+    Fabrication by a caller does not grant execution — the mark-time
+    comparison re-reads current SQL and current clock.
+    """
+
+    presence: PresenceRecord
+    holder_pid: int
+    process_started_at: int
+    proof_observed_at: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.presence, PresenceRecord):
+            raise TypeError(
+                "RegistrationSnapshot.presence must be PresenceRecord, "
+                f"got {type(self.presence).__name__}"
+            )
+        if not isinstance(self.holder_pid, int) or isinstance(self.holder_pid, bool):
+            raise TypeError(
+                "RegistrationSnapshot.holder_pid must be int"
+            )
+        if self.holder_pid <= 0:
+            raise ValueError(
+                "RegistrationSnapshot.holder_pid must be positive "
+                "(0 is reserved for stale/stopping registrations)"
+            )
+        if not isinstance(self.process_started_at, int):
+            raise TypeError(
+                "RegistrationSnapshot.process_started_at must be int"
+            )
+        if not isinstance(self.proof_observed_at, int):
+            raise TypeError(
+                "RegistrationSnapshot.proof_observed_at must be int"
+            )

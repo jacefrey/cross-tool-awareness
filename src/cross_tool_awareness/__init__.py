@@ -1,9 +1,11 @@
 """cross_tool_awareness: shared storage + dispatcher primitives.
 
-See the design spec at
-machine-manager/docs/superpowers/specs/2026-10-11-shared-awareness-package-design.md
+Design authority (v0.5.0):
+codex-manager/docs/superpowers/specs/2026-10-14-awareness-pre-live-hardening-design.md
+Prior design authority (v0.4.0):
+machine-manager/docs/superpowers/specs/2026-10-12-shared-awareness-package-v0.4-design.md
 
-v0.4.0. Fixture-only. Not authorized for live use.
+v0.5.0. Fixture-only. Not authorized for live use.
 """
 
 from .adapter import BoundedAdapter, WakeAdapter, WakeNotice
@@ -21,6 +23,7 @@ from .composite_storage import CompositeStorage
 from .contracts import (
     SUMMARY_OMITTED,
     CapabilityDecision,
+    ClaimantIdentity,
     ClaimStatus,
     DeliveryState,
     Disposition,
@@ -33,6 +36,7 @@ from .contracts import (
     QueueAttempt,
     QueueCapability,
     QueueOutcome,
+    RegistrationSnapshot,
     RegistrationUpdate,
     validate_notice_summary,
 )
@@ -85,7 +89,7 @@ from .storage import (
     create_authenticated_targeted_send,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "__version__",
@@ -98,11 +102,12 @@ __all__ = [
     "issue_capability", "revoke_capability", "rotate_capability",
     "verify_capability", "verify_capability_with_liveness",
     # contracts
-    "CapabilityDecision", "ClaimStatus", "DeliveryState", "Disposition",
+    "CapabilityDecision", "ClaimantIdentity", "ClaimStatus",
+    "DeliveryState", "Disposition",
     "DispositionReceipt", "NoticeClaim", "NoticeKey", "NoticeObservation",
     "PresenceRecord", "PresenceState", "QueueAttempt", "QueueCapability",
-    "QueueOutcome", "RegistrationUpdate", "SUMMARY_OMITTED",
-    "validate_notice_summary",
+    "QueueOutcome", "RegistrationSnapshot", "RegistrationUpdate",
+    "SUMMARY_OMITTED", "validate_notice_summary",
     # composite storage
     "CompositeStorage",
     # dispatcher
