@@ -1,5 +1,88 @@
 # Changelog
 
+## 0.5.0 (2026-10-15)
+
+Phase 2b pre-live hardening of CTA against process-contention and legacy
+owner-less entry points. v0.4.0 remains supported for existing consumers
+until they adopt v0.5.0; v0.5.0 is a successor candidate pending
+independent acceptance. The package remains fixture-only and is not
+authorized for live use.
+
+Design authority:
+[2026-10-14-awareness-pre-live-hardening-design.md](https://github.com/jacefrey/codex-manager/blob/main/docs/superpowers/specs/2026-10-14-awareness-pre-live-hardening-design.md)
+(revision tip `abc1864`, MM-approved at bridge seq 343).
+
+### Added
+- `ClaimantIdentity` and `RegistrationSnapshot` frozen dataclasses in
+  `contracts`. `ClaimantIdentity` requires strict `uuid.UUID` for its two
+  identity fields and a nonempty `registration_fence` str.
+- `dispatch_ownership` package-owned witness table keyed by
+  `claim_lease_token`, with FK to `targeted_deliveries`. Retained across
+  receipt-wins so a late `finalize_attempt` from the matching owner can
+  still authenticate against it (R4).
+- Schema 4 adds nullable `claimant_session_uuid`,
+  `claimant_session_incarnation_id`, `claimant_registration_fence` to
+  `targeted_deliveries` under all-or-nothing CHECK and claimed/dispatching
+  requires-full-owner CHECK.
+- Migration v3→v4 with quiescent-only guard (refuses claimed, dispatching,
+  notified, ambiguous, or blocked state) and preserve-unchanged refusal:
+  no backup is written, no mutation applied, and no owner identities are
+  invented. v2 bridges still migrate forward via the v2→v3→v4 chain.
+- 16 new tests (3 files): tripwire coverage for the disabled dispatcher
+  and probe; witness retention + late-finalize authentication; multi-
+  process contention + wrong-owner rejection.
+
+### Changed
+- `CompositeStorage` constructor now requires `claimant: ClaimantIdentity`
+  and `clock: Callable[[], int]`. Claimant is immutable for the facade's
+  lifetime; no refresh-in-place. After a trusted re-registration or fence
+  change, owner wiring must construct a NEW facade.
+- Every public writer in `leases.py` requires `claimant` + `clock`
+  keyword args. Entry points own `BEGIN IMMEDIATE` transactions, reject
+  an active caller transaction with `sqlite3.ProgrammingError`, and roll
+  back on all exceptions.
+- Default claim lease TTL raised from 15 to 30 seconds (R8).
+- `+/- 30 s` freshness window enforced at the mark boundary against the
+  injected clock (R7); no timestamp clamping.
+- `pre_adapter_mark` now atomically inserts the `dispatch_ownership`
+  witness with the `claimed → dispatching` state change in one txn (R4).
+- `finalize_attempt` authenticates against the dispatch_ownership witness
+  before any attempt insert; wrong owner / wrong token / wrong key
+  changes zero rows (returns `unauthorized`).
+- Rollback refuses when `dispatch_ownership` rows have no matching
+  delivery — no destructive teardown of unmatched witnesses (R4).
+
+### Breaking
+- No owner-less compatibility mode. v0.4.0 call sites that constructed
+  `CompositeStorage` without `claimant`/`clock`, or called `leases.*`
+  without the new kwargs, raise `TypeError`.
+- Schema 4 is required. v0.4.0 clients cannot read a v4 DB (`claimed` /
+  `dispatching` without owner tuple violates CHECK).
+
+### Disabled (fail-close)
+- `dispatcher.run_one_iteration` raises
+  `RuntimeError('legacy dispatcher disabled: claimant-aware bounded
+  runner required')` immediately. Even a bare `run_one_iteration()` call
+  raises before any arg is read.
+- `probe.run_foreground_probe` raises the same `RuntimeError` BEFORE DB
+  connection, lease acquisition, clock call, sleep, measurement, or
+  adapter entry — including `duration_seconds=0`.
+- Both callables remain in `__all__` with explicit disabled-legacy
+  comments in `__init__.py`. `ProbeResult` retained as inert data type
+  for v0.4-era saved recordings. A claimant-aware bounded runner is
+  deferred to a later roadmap gate.
+
+### Not changed
+- Registry, capability, backup, reconciliation, authenticated-targeted-
+  send paths retain their accepted v0.4.0 contracts.
+- Schema migration v2→v3 hop preserved as a separate validated step.
+- `SingletonDispatcherLease` class is unchanged.
+
+### Verification
+- 241/241 tests pass locally on tip of `feat/v05-claimant-ownership`.
+- Independent acceptance is pending (CXM fresh-context review + separate
+  MM fresh-session acceptance before merge).
+
 ## 0.4.0 (2026-10-13)
 
 Task 9 follow-up batch implementing M3, M6, M1, M9, and M10 from the

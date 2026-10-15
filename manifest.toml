@@ -1,7 +1,10 @@
 # cross-tool-awareness package manifest
 #
-# Design authority (lives in machine-manager, the owning project):
-#   machine-manager/docs/superpowers/specs/2026-10-11-shared-awareness-package-design.md
+# Design authority (v0.5.0, lives in codex-manager, the Phase 2b review home):
+#   codex-manager/docs/superpowers/specs/2026-10-14-awareness-pre-live-hardening-design.md
+#
+# Prior design authority (v0.4.0):
+#   machine-manager/docs/superpowers/specs/2026-10-12-shared-awareness-package-v0.4-design.md
 #
 # Contract authority (lives in codex-manager, the consuming adapter's owner):
 #   codex-manager/docs/superpowers/specs/2026-10-05-codex-gate1-contracts.md
@@ -14,12 +17,12 @@
 
 format_version = 1
 
-design_spec = "machine-manager/docs/superpowers/specs/2026-10-11-shared-awareness-package-design.md"
+design_spec = "codex-manager/docs/superpowers/specs/2026-10-14-awareness-pre-live-hardening-design.md"
 
 contracts_source = "codex-manager/docs/superpowers/specs/2026-10-05-codex-gate1-contracts.md"
 contracts_source_commit = "0087ebe"
 
-package_version = "0.4.0"
-package_sha256 = "d19d34572a38d28fbe474f643be6fc91f4e818726e99a5a168437b8ff1dca1c6"
+package_version = "0.5.0"
+package_sha256 = "7d34767b1f045f0c49c32972fb31af37f8a1cb02f6275cbfe032326355db1616"
 
 changelog_heading = "Changelog"
