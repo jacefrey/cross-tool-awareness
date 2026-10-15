@@ -198,8 +198,10 @@ class CompositeStorage:
         *,
         lease_token: str,
     ) -> None:
-        """Release before adapter entry. Raises RuntimeError if the claim's
-        lease was lost (concurrent recovery, wrong owner, etc.)."""
+        """Release before adapter entry. Clears owner/token/expiry and
+        PRESERVES ``next_attempt_at`` (design: pre-entry release never
+        reschedules). Raises RuntimeError if the claim's lease was lost
+        (concurrent recovery, wrong owner, etc.)."""
         if state not in {"pending", "blocked"}:
             raise ValueError("state must be pending or blocked")
         if not isinstance(reason, str) or not reason:
@@ -209,7 +211,7 @@ class CompositeStorage:
             claim_lease_token=lease_token,
             next_state=state,
             diagnostic=reason,
-            next_attempt_at=int(self._clock()),
+            next_attempt_at=None,
             claimant=self.claimant,
             clock=self._clock,
             message_id=claim.message_id,
@@ -266,6 +268,9 @@ class CompositeStorage:
           - ``'already_finalized'``: exact retry of a previously-recorded
             attempt (UNIQUE on claim_lease_token). ``attempt_recorded``
             False (the prior row remains).
+          - ``'altered_retry_rejected'``: same token but a different
+            persisted field (outcome/reason/attempted_at/finished_at or
+            delivery key). Zero rows changed; ``attempt_recorded`` False.
           - ``'lease_already_released'``: witness matched but delivery had
             no in-flight state when the UPDATE ran (recovery or operator
             reconciliation after mark).

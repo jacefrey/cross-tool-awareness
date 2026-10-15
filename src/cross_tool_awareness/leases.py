@@ -149,7 +149,9 @@ class PreAdapterReleaseResult:
 
 @dataclass(frozen=True)
 class FinalizationResult:
-    status: str                    # 'finalized' | 'already_finalized' | 'lease_already_released' | 'receipt_already_won'
+    # 'finalized' | 'unauthorized' | 'already_finalized' |
+    # 'altered_retry_rejected' | 'lease_already_released' | 'receipt_already_won'
+    status: str
     new_state: Optional[str] = None
     attempt_recorded: bool = False
 
@@ -536,7 +538,7 @@ def pre_adapter_release(
     claim_lease_token: str,
     next_state: str,
     diagnostic: str,
-    next_attempt_at: int,
+    next_attempt_at: Optional[int],
     claimant: ClaimantIdentity,
     clock: Callable[[], int],
     message_id,
@@ -548,6 +550,10 @@ def pre_adapter_release(
     Does NOT create a queue_attempts row. Does NOT increment attempt_count.
     Used when target revalidation fails (next_state='pending') or adapter
     missing/not-enabled (next_state='blocked').
+
+    ``next_attempt_at=None`` preserves the stored schedule (the facade's
+    pre-entry release always passes ``None``, per the design's "preserve
+    next_attempt_at" rule); an int sets it explicitly.
 
     v0.5.0: requires exact owner/key/token. Still only operates on
     delivery_state == 'claimed' — a release cannot enter an adapter and must
@@ -566,7 +572,7 @@ def pre_adapter_release(
             "    claimant_session_uuid = NULL, "
             "    claimant_session_incarnation_id = NULL, "
             "    claimant_registration_fence = NULL, "
-            "    next_attempt_at = ?, "
+            "    next_attempt_at = COALESCE(?, next_attempt_at), "
             "    last_error_class = ? "
             "WHERE message_id = ? AND target_session_uuid = ? "
             "  AND target_session_incarnation_id = ? "
@@ -575,7 +581,9 @@ def pre_adapter_release(
             "  AND claimant_session_incarnation_id = ? "
             "  AND claimant_registration_fence = ? "
             "  AND delivery_state = 'claimed'",
-            (next_state, int(next_attempt_at), diagnostic,
+            (next_state,
+             None if next_attempt_at is None else int(next_attempt_at),
+             diagnostic,
              str(message_id), str(target_session_uuid),
              str(target_session_incarnation_id),
              claim_lease_token,
@@ -615,9 +623,10 @@ def finalize_attempt(
         the attempt (to record what we tried) but preserve ``observed`` —
         return ``receipt_already_won``.
       - If the attempt-insert hits ``UNIQUE constraint failed:
-        queue_attempts.claim_lease_token``, this is an exact retry of a
-        previously-finalized attempt — return ``already_finalized`` without
-        state change.
+        queue_attempts.claim_lease_token``, compare the stored attempt with
+        the request: identical → ``already_finalized`` (exact retry, zero
+        rows changed); any persisted field differs →
+        ``altered_retry_rejected`` (zero rows changed).
 
     Design R4: receipt handling may clear active lease/owner fields on the
     delivery (via tr_receipt_marks_observed) but the dispatch_ownership
@@ -662,10 +671,26 @@ def finalize_attempt(
                  int(attempted_at), int(now), reason),
             )
         except sqlite3.IntegrityError as e:
-            if "UNIQUE constraint failed: queue_attempts.claim_lease_token" in str(e):
-                return FinalizationResult(status="already_finalized",
-                                          attempt_recorded=False)
-            raise
+            if "UNIQUE constraint failed: queue_attempts.claim_lease_token" not in str(e):
+                raise
+            # R5: an exact retry is idempotent; altered content under the same
+            # token is rejected. Compare every persisted attempt field.
+            stored = db.execute(
+                "SELECT message_id, target_session_uuid,"
+                " target_session_incarnation_id, outcome, attempted_at,"
+                " finished_at, reason FROM queue_attempts"
+                " WHERE claim_lease_token = ?",
+                (claim_lease_token,),
+            ).fetchone()
+            exact = stored is not None and tuple(stored) == (
+                str(message_id), str(target_session_uuid),
+                str(target_session_incarnation_id), outcome,
+                int(attempted_at), int(now), reason,
+            )
+            return FinalizationResult(
+                status="already_finalized" if exact else "altered_retry_rejected",
+                attempt_recorded=False,
+            )
 
         # Advance delivery state, but only if the owner still matches an
         # in-flight state. If a receipt won first (delivery_state='observed'),
