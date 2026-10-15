@@ -2,7 +2,7 @@
 
 Shared storage + dispatcher primitives for cross-tool awareness between Codex and Claude Code sessions on a single Mac. Owned by machine-manager.
 
-**Status:** v0.5.1 — fixture-only candidate pending independent acceptance. Not authorized for live use.
+**Status:** v0.5.2 — fixture-only candidate pending independent validation. Not authorized for live use.
 
 Design authority (Phase 2b pre-live hardening, lives in `codex-manager`):
 `codex-manager/docs/superpowers/specs/2026-10-14-awareness-pre-live-hardening-design.md` (revision `abc1864`, R1–R14).

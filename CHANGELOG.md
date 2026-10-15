@@ -1,6 +1,39 @@
 # Changelog
 
-## 0.5.1 (2026-10-15)
+## 0.5.2 (2026-10-15)
+
+Successor candidate to 0.5.1 (`c4ff7da`, never released; superseded).
+Carries the one Important finding (I11) from codex-manager's independent
+recheck of the 0.5.1 tuple (`mm-cxm-coord` seq 374; review
+`codex-manager/docs/superpowers/reviews/2026-10-15-cta-v051-independent-recheck.md`).
+Implemented by codex-manager under the review-fix-validate operating mode
+(commit `36a850c`) and validated by machine-manager from an isolated clone.
+No design change: every 0.5.1 entry below stands. The package remains
+fixture-only and is not authorized for live use.
+
+### Fixed (correctness)
+- **I11 / R9** — `_collect_managed_state` now reads `sqlite_master.tbl_name`
+  and treats any non-managed index or trigger attached to a managed table as
+  an unknown artifact regardless of its name prefix. Because that collector
+  feeds `_validate_schema_exact`, the refusal applies before the first backup,
+  again under each hop's write lock, and in `rollback` before any drop.
+  Previously a foreign-named `UNIQUE` index or `AFTER INSERT` trigger on
+  `targeted_deliveries` passed the exact-source check and was destroyed by
+  the table rebuild while `apply` reported `applied`, silently removing the
+  database's enforcement and audit behavior. SQLite internal indexes and
+  objects on unrelated bridge-owned tables remain permitted.
+  Tests: `test_foreign_schema_objects.py` — unknown index/trigger refused with
+  enforcement and audit behavior intact; object introduced after the outer
+  inspection but before the write lock refused; rollback refuses without
+  destroying; unrelated bridge objects allowed and functional (versions
+  2/3/4 × index/trigger, 17 cases).
+
+### Changed
+- Version surfaces 0.5.2; `docs/releases/v0.5.2.md`; the 0.5.1 release doc
+  is bannered superseded. The 0.5.1 deferred-minor list is unchanged except
+  that "foreign-named index/trigger on a managed table" is now I11 (fixed).
+
+## 0.5.1 (2026-10-15) — candidate superseded by 0.5.2
 
 Remediation candidate for the ten Important correctness findings
 (I01–I10), the deleted-coverage obligations and the Minor from

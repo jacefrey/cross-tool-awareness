@@ -9,7 +9,7 @@ import cross_tool_awareness
 from cross_tool_awareness.migrations import PACKAGE_VERSION
 
 ROOT = Path(cross_tool_awareness.__file__).parents[2]
-CANDIDATE = "0.5.1"
+CANDIDATE = "0.5.2"
 
 
 def test_versions_agree():
