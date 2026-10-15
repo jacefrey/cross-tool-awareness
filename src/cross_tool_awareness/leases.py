@@ -253,7 +253,8 @@ def claim_delivery(
         if not _claimant_live_in_sql(db, claimant, now=completion_now):
             return None
         return _claim_delivery_in_transaction(
-            db, now=now, lease_ttl_seconds=lease_ttl_seconds,
+            db, now=now, write_now=completion_now,
+            lease_ttl_seconds=lease_ttl_seconds,
             claimant=claimant, tool=tool, wake_capability=wake_capability,
         )
 
@@ -262,12 +263,19 @@ def _claim_delivery_in_transaction(
     db: sqlite3.Connection,
     *,
     now: int,
+    write_now: int,
     lease_ttl_seconds: int,
     claimant: ClaimantIdentity,
     tool: str,
     wake_capability: str,
 ) -> Optional[ClaimedDelivery]:
     """Claim inside a transaction already owned by the package.
+
+    ``now`` is scheduling input and only gates pending due-ness
+    (``next_attempt_at <= now``). ``write_now`` is the post-lock clock sample
+    (design R7): it alone decides whether a ``claimed`` lease is recoverable
+    (``claim_lease_expires_at <= write_now``; equality is expired) and sets the
+    new expiry ``write_now + lease_ttl_seconds``.
 
     Writes the full owner tuple into the claimed row.
     """
@@ -287,7 +295,7 @@ def _claim_delivery_in_transaction(
         "ORDER BY CASE WHEN td.delivery_state = 'pending' THEN td.next_attempt_at "
         "              ELSE td.claim_lease_expires_at END ASC "
         "LIMIT 1",
-        (tool, wake_capability, now, now),
+        (tool, wake_capability, now, write_now),
     ).fetchone()
     if row is None:
         return None
@@ -303,12 +311,12 @@ def _claim_delivery_in_transaction(
         "       OR (delivery_state = 'claimed' "
         "           AND claim_lease_token = ? "
         "           AND claim_lease_expires_at <= ?))",
-        (token, now + int(lease_ttl_seconds),
+        (token, write_now + int(lease_ttl_seconds),
          str(claimant.session_uuid), str(claimant.session_incarnation_id),
          claimant.registration_fence,
          row["message_id"], row["target_session_uuid"],
          row["target_session_incarnation_id"],
-         row["claim_lease_token"], now),
+         row["claim_lease_token"], write_now),
     )
     if cur.rowcount == 0:
         return None
