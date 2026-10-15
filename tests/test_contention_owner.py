@@ -78,11 +78,14 @@ def _presence_from(cid: ClaimantIdentity, *, now: int = 10,
 
 
 def _snapshot(cid: ClaimantIdentity, *, now: int = 10, holder_pid: int = 1234,
-              process_started_at: int = 1_000_000) -> RegistrationSnapshot:
+              process_started_at: int = 1_000_000,
+              proof_observed_at: int | None = None) -> RegistrationSnapshot:
+    # `now` must equal the registration's now (presence mirrors the row);
+    # proof_observed_at varies independently (I03 exact comparison).
     return RegistrationSnapshot(
         presence=_presence_from(cid, now=now),
         holder_pid=holder_pid, process_started_at=process_started_at,
-        proof_observed_at=now,
+        proof_observed_at=now if proof_observed_at is None else proof_observed_at,
     )
 
 
@@ -237,8 +240,9 @@ def test_dispatching_never_time_recovered(tmp_path):
         target_session_incarnation_id=claim.target_session_incarnation_id,
         lease_token=claim.claim_lease_token, now=11,
         claimant=cid, clock=lambda: 11,
-        claimant_snapshot=_snapshot(cid, now=11),
-        target_snapshot=_snapshot(target, now=11, holder_pid=5678,
+        claimant_snapshot=_snapshot(cid, now=10, proof_observed_at=11),
+        target_snapshot=_snapshot(target, now=10, proof_observed_at=11,
+                                   holder_pid=5678,
                                    process_started_at=2_000_000),
         tool="claude", wake_capability="notify_only",
     )
@@ -375,7 +379,7 @@ def test_multi_process_contention_only_one_claims(tmp_path):
             "uuid": str(cid.session_uuid),
             "inc": str(cid.session_incarnation_id),
             "fence": f"f{i}",
-            "alias": f"c-{i}",
+            "alias": f"a-{str(cid.session_uuid)[:8]}",  # must match _register
         })
     target = ClaimantIdentity(session_uuid=uuid4(),
                               session_incarnation_id=uuid4(),

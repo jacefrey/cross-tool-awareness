@@ -133,11 +133,15 @@ class CompositeStorage:
         *,
         lease_token: str,
     ) -> PresenceRecord | None:
-        """Return the current PresenceRecord for the claim's target, iff:
+        """Return the current PresenceRecord for the claim's target, iff
+        (design R5):
 
-        - this claim's lease is still live under this facade's claimant,
-        - the target registration is still live and matches the claim's
-          captured target fence,
+        - full delivery key + exact token + exact owner tuple match and the
+          lease is unexpired at ``now`` (equality is expired),
+        - the facade's claimant is CURRENTLY live: its own registration row
+          exists with the same fence, unrevoked, unexpired, eligible state,
+        - the target registration is live, eligible, and still carries the
+          fence captured at claim time (``claim.target_registration_fence``),
         - routing still matches the facade's (tool, wake_capability).
 
         Zero rows → None (caller should release). This is read-only.
@@ -158,7 +162,14 @@ class CompositeStorage:
             "  AND d.claimant_registration_fence = ? "
             "  AND r.revoked_at IS NULL AND r.expires_at > ? "
             "  AND r.state IN ('active', 'busy', 'idle') "
-            "  AND r.tool = ? AND r.wake_capability = ?",
+            "  AND r.registration_fence = ? "
+            "  AND r.tool = ? AND r.wake_capability = ? "
+            "  AND EXISTS (SELECT 1 FROM session_registrations AS c "
+            "              WHERE c.session_uuid = d.claimant_session_uuid "
+            "                AND c.session_incarnation_id = d.claimant_session_incarnation_id "
+            "                AND c.registration_fence = d.claimant_registration_fence "
+            "                AND c.revoked_at IS NULL AND c.expires_at > ? "
+            "                AND c.state IN ('active', 'busy', 'idle'))",
             (
                 str(claim.message_id),
                 str(claim.target_session_uuid),
@@ -169,8 +180,10 @@ class CompositeStorage:
                 str(self.claimant.session_incarnation_id),
                 self.claimant.registration_fence,
                 int(now),
+                claim.target_registration_fence,
                 self.tool,
                 self.wake_capability,
+                int(now),
             ),
         ).fetchone()
         if row is None:

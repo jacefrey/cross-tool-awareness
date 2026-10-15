@@ -124,6 +124,10 @@ class ClaimedDelivery:
     claimant_session_uuid: str
     claimant_session_incarnation_id: str
     claimant_registration_fence: str
+    # Target registration fence captured in the claim transaction (R5
+    # revalidate contract); revalidation refuses once the target's fence
+    # rotates away from this value.
+    target_registration_fence: str
 
 
 @dataclass(frozen=True)
@@ -192,29 +196,71 @@ def _check_snapshot_freshness(
     return None
 
 
-def _claimant_live_in_sql(
-    db: sqlite3.Connection,
-    claimant: ClaimantIdentity,
-    *,
-    now: int,
-) -> bool:
-    """Return True iff the claimant's session_registrations row is live.
+# Design R5 §3.2: identity comparison uses every PresenceRecord field except
+# heartbeat_at, plus holder_pid/process_started_at. expires_at IS compared
+# (ruling R-S, confirmed by codex-manager at seq 371): an expiry extension
+# invalidates the old snapshot and the owner must re-observe outside the
+# transaction.
+_SNAPSHOT_COMPARED_FIELDS = (
+    "alias", "tool", "project_slug", "project_root", "role", "state",
+    "wake_capability", "registration_fence", "wake_locator", "started_at",
+    "expires_at",
+)
+_ELIGIBLE_STATES = ("active", "busy", "idle")
 
-    Live means: exact (session_uuid, session_incarnation_id) match AND the
-    stored registration_fence matches AND not revoked AND not expired at
-    ``now``. Caller must hold the write lock (``BEGIN IMMEDIATE``) before
-    calling so the result is read-consistent with the subsequent UPDATE.
+
+def _plain(value):
+    value = getattr(value, "value", value)
+    return str(value) if isinstance(value, UUID) else value
+
+
+def _registration_matches_snapshot(
+    db: sqlite3.Connection,
+    *,
+    snapshot: RegistrationSnapshot,
+    expected_key,
+    expected_fence: Optional[str],
+    now: int,
+    route,
+) -> Optional[str]:
+    """Return None iff ``snapshot`` describes ``expected_key``/``expected_fence``
+    AND matches the CURRENT session_registrations row on every compared field
+    AND that row is unrevoked, unexpired at ``now`` and in an eligible state
+    AND (if ``route`` is given) routes to ``(tool, wake_capability)``.
+
+    Otherwise a diagnostic string. Caller must hold the write lock so the
+    result is read-consistent with the subsequent UPDATE.
     """
-    row = db.execute(
-        "SELECT 1 FROM session_registrations"
-        " WHERE session_uuid = ? AND session_incarnation_id = ?"
-        "   AND registration_fence = ?"
-        "   AND revoked_at IS NULL"
-        "   AND expires_at > ?",
-        (str(claimant.session_uuid), str(claimant.session_incarnation_id),
-         claimant.registration_fence, int(now)),
+    p = snapshot.presence
+    key = (str(p.session_uuid), str(p.session_incarnation_id))
+    if expected_key is not None and key != tuple(str(k) for k in expected_key):
+        return "snapshot_identity_mismatch"
+    if expected_fence is not None and p.registration_fence != expected_fence:
+        return "snapshot_identity_mismatch"
+    cur = db.cursor()
+    cur.row_factory = sqlite3.Row
+    r = cur.execute(
+        "SELECT * FROM session_registrations"
+        " WHERE session_uuid = ? AND session_incarnation_id = ?",
+        key,
     ).fetchone()
-    return row is not None
+    if r is None:
+        return "registration_missing"
+    for field in _SNAPSHOT_COMPARED_FIELDS:
+        if _plain(getattr(p, field)) != r[field]:
+            return f"registration_changed:{field}"
+    if (r["holder_pid"] != snapshot.holder_pid
+            or r["process_started_at"] != snapshot.process_started_at):
+        return "registration_changed:process"
+    if r["revoked_at"] is not None:
+        return "registration_revoked"
+    if r["expires_at"] <= int(now):
+        return "registration_expired"
+    if r["state"] not in _ELIGIBLE_STATES:
+        return "registration_not_eligible"
+    if route is not None and (r["tool"], r["wake_capability"]) != tuple(route):
+        return "route_mismatch"
+    return None
 
 
 # --- claim_delivery --------------------------------------------------------
@@ -250,7 +296,12 @@ def claim_delivery(
                                               label="claimant")
         if freshness is not None:
             return None
-        if not _claimant_live_in_sql(db, claimant, now=completion_now):
+        if _registration_matches_snapshot(
+            db, snapshot=claimant_snapshot,
+            expected_key=(claimant.session_uuid, claimant.session_incarnation_id),
+            expected_fence=claimant.registration_fence,
+            now=completion_now, route=None,
+        ) is not None:
             return None
         return _claim_delivery_in_transaction(
             db, now=now, write_now=completion_now,
@@ -284,7 +335,8 @@ def _claim_delivery_in_transaction(
     row = db.execute(
         "SELECT td.message_id, td.target_session_uuid,"
         "       td.target_session_incarnation_id,"
-        "       td.delivery_state, td.claim_lease_token "
+        "       td.delivery_state, td.claim_lease_token,"
+        "       sr.registration_fence AS target_registration_fence "
         "FROM targeted_deliveries td "
         "JOIN session_registrations sr"
         "  ON sr.session_uuid = td.target_session_uuid"
@@ -328,6 +380,7 @@ def _claim_delivery_in_transaction(
         claimant_session_uuid=str(claimant.session_uuid),
         claimant_session_incarnation_id=str(claimant.session_incarnation_id),
         claimant_registration_fence=claimant.registration_fence,
+        target_registration_fence=row["target_registration_fence"],
     )
 
 
@@ -372,21 +425,22 @@ def pre_adapter_mark(
         if _check_snapshot_freshness(completion_now, target_snapshot,
                                      label="target") is not None:
             return False
-        if not _claimant_live_in_sql(db, claimant, now=completion_now):
+        # Both snapshots must describe their registration AND match the
+        # current rows field-for-field (R5 §3.2); the target must also still
+        # route to this facade's (tool, wake_capability).
+        if _registration_matches_snapshot(
+            db, snapshot=claimant_snapshot,
+            expected_key=(claimant.session_uuid, claimant.session_incarnation_id),
+            expected_fence=claimant.registration_fence,
+            now=completion_now, route=None,
+        ) is not None:
             return False
-        # Verify the target is still a live registration matching the
-        # target_snapshot's PID/started_at. target_snapshot is already
-        # fresh-window-vetted above; the SQL join here checks persistence.
-        target_live = db.execute(
-            "SELECT 1 FROM session_registrations"
-            " WHERE session_uuid = ? AND session_incarnation_id = ?"
-            "   AND holder_pid = ? AND process_started_at = ?"
-            "   AND revoked_at IS NULL AND expires_at > ?",
-            (str(target_session_uuid), str(target_session_incarnation_id),
-             target_snapshot.holder_pid, target_snapshot.process_started_at,
-             completion_now),
-        ).fetchone()
-        if target_live is None:
+        if _registration_matches_snapshot(
+            db, snapshot=target_snapshot,
+            expected_key=(target_session_uuid, target_session_incarnation_id),
+            expected_fence=None,
+            now=completion_now, route=(tool, wake_capability),
+        ) is not None:
             return False
         # Exact-owner UPDATE: wrong claimant, wrong token, or wrong key
         # changes zero rows.

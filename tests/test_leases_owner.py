@@ -70,7 +70,7 @@ def _make_presence(cid: ClaimantIdentity, now: int = 10) -> PresenceRecord:
     return PresenceRecord(
         session_uuid=cid.session_uuid,
         session_incarnation_id=cid.session_incarnation_id,
-        alias="claimant", tool="claude",
+        alias=f"a-{str(cid.session_uuid)[:8]}", tool="claude",
         project_slug="p", project_root="/tmp/p", role="worker",
         state="active", wake_capability="notify_only",
         registration_fence=cid.registration_fence,
@@ -103,8 +103,10 @@ def _register(db: sqlite3.Connection, cid: ClaimantIdentity, *,
 def _snapshot(cid: ClaimantIdentity, *, holder_pid: int = 1234,
               process_started_at: int = 1_000_000,
               proof_observed_at: int = 10) -> RegistrationSnapshot:
+    # Presence mirrors the row _register() writes (registration now=10);
+    # proof_observed_at varies independently (I03 exact comparison).
     return RegistrationSnapshot(
-        presence=_make_presence(cid, now=proof_observed_at),
+        presence=_make_presence(cid, now=10),
         holder_pid=holder_pid, process_started_at=process_started_at,
         proof_observed_at=proof_observed_at,
     )

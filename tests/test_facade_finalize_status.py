@@ -64,7 +64,7 @@ def _pres(cid: ClaimantIdentity, now: int = 10) -> PresenceRecord:
     return PresenceRecord(
         session_uuid=cid.session_uuid,
         session_incarnation_id=cid.session_incarnation_id,
-        alias="c", tool="claude",
+        alias=f"a-{str(cid.session_uuid)[:8]}", tool="claude",
         project_slug="p", project_root="/tmp/p", role="worker",
         state="active", wake_capability="notify_only",
         registration_fence=cid.registration_fence,
@@ -74,8 +74,10 @@ def _pres(cid: ClaimantIdentity, now: int = 10) -> PresenceRecord:
 
 
 def _snap(cid: ClaimantIdentity, *, hp=1234, pst=1_000_000, now=10):
+    # Presence mirrors the row _register() writes (registration now=10);
+    # `now` here is the proof time and varies independently.
     return RegistrationSnapshot(
-        presence=_pres(cid, now=now), holder_pid=hp,
+        presence=_pres(cid, now=10), holder_pid=hp,
         process_started_at=pst, proof_observed_at=now,
     )
 
