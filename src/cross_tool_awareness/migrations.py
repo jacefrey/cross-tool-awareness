@@ -50,7 +50,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .backup import BackupResult, create_backup
+from .backup import BackupResult, BackupVerificationFailure, create_backup
 
 
 EXPECTED_SCHEMA_VERSION = 4
@@ -128,6 +128,44 @@ _V4_ADDED_ARTIFACTS = frozenset({
 
 def _pre_v4_managed_set() -> set[tuple[str, str]]:
     return _expected_managed_set() - _V4_ADDED_ARTIFACTS
+
+
+def _managed_set_for(version: int) -> set[tuple[str, str]]:
+    """Exact managed artifact set for a schema version (v2 and v3 share one)."""
+    if version == EXPECTED_SCHEMA_VERSION:
+        return _expected_managed_set()
+    return _pre_v4_managed_set()
+
+
+class MigrationRefused(Exception):
+    """Under-lock recheck failed; nothing was mutated by this hop."""
+
+
+@dataclass(frozen=True)
+class HopOutcome:
+    """Result of one guarded migration hop.
+
+    Ordinary errors (SQLite DDL/COMMIT errors, backup failures, refusals,
+    FK-restoration failures) are always reported here, never raised. Only
+    ``KeyboardInterrupt``/``SystemExit`` propagate.
+    """
+    status: str                                    # 'applied' | 'refused' | 'failed'
+    version_after: Optional[int]                   # MAX(version) re-read after the hop
+    reason: str = ""
+    backup: Optional[BackupResult] = None          # THIS hop's verified backup, if created
+    unverified_backup_path: Optional[Path] = None  # file left when verification failed
+
+
+# Shipped canonical historical schemas (byte-identical to the test fixtures;
+# pinned by tests/test_migration_guarded.py).
+_HISTORICAL_SCHEMA_FILES = {2: "schema_v2.sql", 3: "schema_v3.sql"}
+
+# Tables whose row counts must be unchanged by any hop (R9 preservation).
+_PRESERVED_TABLES = (
+    "messages", "session_registrations", "session_capabilities",
+    "targeted_deliveries", "queue_attempts", "disposition_receipts",
+    "dispatcher_lease", "notice_claims",
+)
 
 
 def _managed_namespace_names() -> set[str]:
@@ -221,22 +259,32 @@ def _normalize_sql(sql: str) -> str:
     return s
 
 
-def _canonical_sql_by_name() -> dict[str, str]:
-    """Parse schema.sql and index canonical normalized SQL by artifact name."""
-    text = _schema_sql_path().read_text()
+def _canonical_sql_by_name_from_text(text: str) -> dict[str, str]:
+    """Index canonical normalized SQL by artifact name from one schema script."""
     out = {}
     for stmt in parse_statements(text):
         norm = _normalize_sql(stmt)
-        # Extract artifact name from CREATE statement
         m = re.match(
             r"CREATE\s+(?:UNIQUE\s+)?(TABLE|INDEX|TRIGGER)\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)",
             norm,
             re.IGNORECASE,
         )
         if m:
-            name = m.group(2)
-            out[name] = norm
+            out[m.group(2)] = norm
     return out
+
+
+def _canonical_sql_by_name() -> dict[str, str]:
+    """Parse schema.sql and index canonical normalized SQL by artifact name."""
+    return _canonical_sql_by_name_from_text(_schema_sql_path().read_text())
+
+
+def _canonical_sql_by_name_for(version: int) -> dict[str, str]:
+    """Canonical SQL-by-name for the current or a shipped historical version."""
+    if version == EXPECTED_SCHEMA_VERSION:
+        return _canonical_sql_by_name()
+    path = Path(__file__).parent / _HISTORICAL_SCHEMA_FILES[version]
+    return _canonical_sql_by_name_from_text(path.read_text())
 
 
 def _collect_managed_state(db: sqlite3.Connection) -> dict:
@@ -288,6 +336,30 @@ def _validate_sql_text_matches_canonical(state: dict) -> Optional[str]:
                 f"SQL text mismatch for managed artifact {name!r}: "
                 f"actual={actual[:120]!r} expected={expected[:120]!r}"
             )
+    return None
+
+
+def _validate_schema_exact(db: sqlite3.Connection, *, version: int) -> Optional[str]:
+    """Exact artifact set for ``version``, no managed-namespace extras, and
+    canonical SQL text for every artifact. Used for the SOURCE under the
+    migration lock and for the DESTINATION before a hop commits (R9)."""
+    state = _collect_managed_state(db)
+    if state["extras"]:
+        return f"unknown managed-namespace artifacts: {sorted(state['extras'])}"
+    present = ({("table", n) for n in state["tables_present"]}
+               | {("index", n) for n in state["indexes_present"]}
+               | {("trigger", n) for n in state["triggers_present"]})
+    expected = _managed_set_for(version)
+    if present != expected:
+        return (f"managed artifact set is not canonical v{version}: "
+                f"missing={sorted(expected - present)} "
+                f"unexpected={sorted(present - expected)}")
+    canonical = _canonical_sql_by_name_for(version)
+    for _, name in sorted(expected):
+        actual = _normalize_sql(state["sql_by_name"].get(name))
+        if actual != canonical.get(name):
+            return (f"SQL text is not canonical v{version} for {name!r}: "
+                    f"actual={actual[:120]!r} expected={canonical.get(name, '')[:120]!r}")
     return None
 
 
@@ -401,213 +473,148 @@ END
 """
 
 
-def _apply_v2_to_v3_migration(db_path: Path, *, now: int) -> None:
-    """Rebuild v2 → v3 under the SQLite FK PRAGMA discipline.
-
-    Must be called with a closed caller-held connection: this function opens
-    its own connection and toggles ``PRAGMA foreign_keys`` outside any
-    transaction (PRAGMA foreign_keys is a no-op inside one). Raises
-    sqlite3.Error on any failure; the finally block restores
-    ``PRAGMA foreign_keys=ON`` even on failure.
+def _v2_to_v3_ddl(conn: sqlite3.Connection, *, now: int) -> None:
+    """v2 → v3 rebuild statements, run inside the guarded hop's transaction.
 
     Legacy session_registrations rows are preserved for FK + audit history
-    but marked ``holder_pid=0``, ``state='stale'``, and ``revoked_at`` is
-    populated (or kept if already revoked). This releases the live-alias
-    unique index so a truthful v0.4 re-registration can replace them with a
-    fresh incarnation UUID. ``proc_start_ns`` nanoseconds are converted to
-    Unix seconds for the new ``process_started_at`` column (lossy but
-    display-only — v0.4 liveness checks use the stored seconds-granularity
-    value against a receiver-owned OS probe, not the pre-v0.4 nanosecond
-    value).
+    but marked ``holder_pid=0``, ``state='stale'``, ``revoked_at`` populated;
+    ``proc_start_ns`` is converted to seconds for ``process_started_at``.
+    Writes the version-3 row (pinned literal, independent of downstream
+    version bumps).
     """
-    conn = sqlite3.connect(str(db_path))
-    try:
-        # Precondition: no active transaction. sqlite3's Connection does not
-        # auto-begin on connect; ensure in_transaction is False.
-        if conn.in_transaction:
-            raise sqlite3.OperationalError(
-                "v2→v3 migration requires a non-active transaction"
-            )
 
-        # FK discipline: toggle OFF BEFORE BEGIN (PRAGMAs inside a transaction
-        # are no-ops). Verify it took.
-        conn.execute("PRAGMA foreign_keys = OFF")
-        fk_off = conn.execute("PRAGMA foreign_keys").fetchone()
-        if fk_off is None or fk_off[0] != 0:
-            raise sqlite3.OperationalError(
-                "PRAGMA foreign_keys=OFF could not be set before migration"
-            )
+    registration_count = conn.execute(
+        "SELECT COUNT(*) FROM session_registrations"
+    ).fetchone()[0]
+    delivery_count = conn.execute(
+        "SELECT COUNT(*) FROM targeted_deliveries"
+    ).fetchone()[0]
 
-        try:
-            conn.execute("BEGIN IMMEDIATE")
+    # 0. Drop all triggers that reference session_registrations or
+    # targeted_deliveries by name. SQLite 3.25+ validates trigger
+    # bodies at ALTER TABLE RENAME TO time; a trigger that references
+    # a mid-rebuild table name raises "no such table" during the
+    # rename. tr_capability_verifier_length is on session_capabilities
+    # and references no other table, so it stays.
+    conn.execute("DROP TRIGGER IF EXISTS tr_receipt_marks_observed")
+    conn.execute("DROP TRIGGER IF EXISTS tr_receipt_requires_eligible_delivery_state")
+    conn.execute("DROP TRIGGER IF EXISTS tr_receipt_requires_live_registration")
 
-            registration_count = conn.execute(
-                "SELECT COUNT(*) FROM session_registrations"
-            ).fetchone()[0]
-            delivery_count = conn.execute(
-                "SELECT COUNT(*) FROM targeted_deliveries"
-            ).fetchone()[0]
+    # 1. Rebuild session_registrations: new shape with holder_pid +
+    # process_started_at, drop proc_start_ns. Legacy rows forced stale
+    # + revoked.
+    conn.execute(_V3_REBUILT_SESSION_REGISTRATIONS.replace(
+        "CREATE TABLE session_registrations",
+        "CREATE TABLE _new_session_registrations",
+    ))
+    conn.execute(
+        "INSERT INTO _new_session_registrations ("
+        "  session_uuid, session_incarnation_id, alias, tool,"
+        "  project_slug, project_root, role, state, wake_capability,"
+        "  registration_fence, wake_locator, started_at, heartbeat_at,"
+        "  expires_at, revoked_at, holder_pid, process_started_at"
+        ") SELECT "
+        "  session_uuid, session_incarnation_id, alias, tool,"
+        "  project_slug, project_root, role, 'stale' AS state,"
+        "  wake_capability, registration_fence, wake_locator,"
+        "  started_at, heartbeat_at, expires_at,"
+        "  COALESCE(revoked_at, ?) AS revoked_at,"
+        "  0 AS holder_pid,"
+        "  COALESCE(proc_start_ns / 1000000000, 0) AS process_started_at "
+        "FROM session_registrations",
+        (now,),
+    )
+    conn.execute("DROP TABLE session_registrations")
+    conn.execute(
+        "ALTER TABLE _new_session_registrations "
+        "RENAME TO session_registrations"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX idx_alias_live "
+        "ON session_registrations(alias) WHERE revoked_at IS NULL"
+    )
+    conn.execute(
+        "CREATE INDEX idx_tool_state "
+        "ON session_registrations(tool, state) WHERE revoked_at IS NULL"
+    )
 
-            # 0. Drop all triggers that reference session_registrations or
-            # targeted_deliveries by name. SQLite 3.25+ validates trigger
-            # bodies at ALTER TABLE RENAME TO time; a trigger that references
-            # a mid-rebuild table name raises "no such table" during the
-            # rename. tr_capability_verifier_length is on session_capabilities
-            # and references no other table, so it stays.
-            conn.execute("DROP TRIGGER IF EXISTS tr_receipt_marks_observed")
-            conn.execute("DROP TRIGGER IF EXISTS tr_receipt_requires_eligible_delivery_state")
-            conn.execute("DROP TRIGGER IF EXISTS tr_receipt_requires_live_registration")
+    # 2. Rebuild targeted_deliveries: add 'dispatching' CHECK value +
+    # dispatch_started_at column. Copy all existing rows unchanged.
+    conn.execute(_V3_REBUILT_TARGETED_DELIVERIES.replace(
+        "CREATE TABLE targeted_deliveries",
+        "CREATE TABLE _new_targeted_deliveries",
+    ))
+    conn.execute(
+        "INSERT INTO _new_targeted_deliveries ("
+        "  message_id, target_session_uuid, target_session_incarnation_id,"
+        "  sender_session_uuid, sender_session_incarnation_id,"
+        "  delivery_state, claim_lease_token, claim_lease_expires_at,"
+        "  dispatch_started_at, created_at, attempt_count,"
+        "  next_attempt_at, expires_at, last_error_class"
+        ") SELECT "
+        "  message_id, target_session_uuid, target_session_incarnation_id,"
+        "  sender_session_uuid, sender_session_incarnation_id,"
+        "  delivery_state, claim_lease_token, claim_lease_expires_at,"
+        "  NULL AS dispatch_started_at, created_at, attempt_count,"
+        "  next_attempt_at, expires_at, last_error_class "
+        "FROM targeted_deliveries"
+    )
+    conn.execute("DROP TABLE targeted_deliveries")
+    conn.execute(
+        "ALTER TABLE _new_targeted_deliveries "
+        "RENAME TO targeted_deliveries"
+    )
+    conn.execute(
+        "CREATE INDEX idx_delivery_eligible "
+        "ON targeted_deliveries(next_attempt_at) "
+        "WHERE delivery_state = 'pending'"
+    )
 
-            # 1. Rebuild session_registrations: new shape with holder_pid +
-            # process_started_at, drop proc_start_ns. Legacy rows forced stale
-            # + revoked.
-            conn.execute(_V3_REBUILT_SESSION_REGISTRATIONS.replace(
-                "CREATE TABLE session_registrations",
-                "CREATE TABLE _new_session_registrations",
-            ))
-            conn.execute(
-                "INSERT INTO _new_session_registrations ("
-                "  session_uuid, session_incarnation_id, alias, tool,"
-                "  project_slug, project_root, role, state, wake_capability,"
-                "  registration_fence, wake_locator, started_at, heartbeat_at,"
-                "  expires_at, revoked_at, holder_pid, process_started_at"
-                ") SELECT "
-                "  session_uuid, session_incarnation_id, alias, tool,"
-                "  project_slug, project_root, role, 'stale' AS state,"
-                "  wake_capability, registration_fence, wake_locator,"
-                "  started_at, heartbeat_at, expires_at,"
-                "  COALESCE(revoked_at, ?) AS revoked_at,"
-                "  0 AS holder_pid,"
-                "  COALESCE(proc_start_ns / 1000000000, 0) AS process_started_at "
-                "FROM session_registrations",
-                (now,),
-            )
-            conn.execute("DROP TABLE session_registrations")
-            conn.execute(
-                "ALTER TABLE _new_session_registrations "
-                "RENAME TO session_registrations"
-            )
-            conn.execute(
-                "CREATE UNIQUE INDEX idx_alias_live "
-                "ON session_registrations(alias) WHERE revoked_at IS NULL"
-            )
-            conn.execute(
-                "CREATE INDEX idx_tool_state "
-                "ON session_registrations(tool, state) WHERE revoked_at IS NULL"
-            )
+    copied_registration_count = conn.execute(
+        "SELECT COUNT(*) FROM session_registrations"
+    ).fetchone()[0]
+    copied_delivery_count = conn.execute(
+        "SELECT COUNT(*) FROM targeted_deliveries"
+    ).fetchone()[0]
+    if copied_registration_count != registration_count:
+        raise sqlite3.IntegrityError(
+            "session_registrations row count changed during v2→v3 "
+            f"rebuild: expected {registration_count}, "
+            f"copied {copied_registration_count}"
+        )
+    if copied_delivery_count != delivery_count:
+        raise sqlite3.IntegrityError(
+            "targeted_deliveries row count changed during v2→v3 "
+            f"rebuild: expected {delivery_count}, "
+            f"copied {copied_delivery_count}"
+        )
 
-            # 2. Rebuild targeted_deliveries: add 'dispatching' CHECK value +
-            # dispatch_started_at column. Copy all existing rows unchanged.
-            conn.execute(_V3_REBUILT_TARGETED_DELIVERIES.replace(
-                "CREATE TABLE targeted_deliveries",
-                "CREATE TABLE _new_targeted_deliveries",
-            ))
-            conn.execute(
-                "INSERT INTO _new_targeted_deliveries ("
-                "  message_id, target_session_uuid, target_session_incarnation_id,"
-                "  sender_session_uuid, sender_session_incarnation_id,"
-                "  delivery_state, claim_lease_token, claim_lease_expires_at,"
-                "  dispatch_started_at, created_at, attempt_count,"
-                "  next_attempt_at, expires_at, last_error_class"
-                ") SELECT "
-                "  message_id, target_session_uuid, target_session_incarnation_id,"
-                "  sender_session_uuid, sender_session_incarnation_id,"
-                "  delivery_state, claim_lease_token, claim_lease_expires_at,"
-                "  NULL AS dispatch_started_at, created_at, attempt_count,"
-                "  next_attempt_at, expires_at, last_error_class "
-                "FROM targeted_deliveries"
-            )
-            conn.execute("DROP TABLE targeted_deliveries")
-            conn.execute(
-                "ALTER TABLE _new_targeted_deliveries "
-                "RENAME TO targeted_deliveries"
-            )
-            conn.execute(
-                "CREATE INDEX idx_delivery_eligible "
-                "ON targeted_deliveries(next_attempt_at) "
-                "WHERE delivery_state = 'pending'"
-            )
+    # 3. Recreate the three receipt triggers. Two gain 'dispatching'
+    # in their eligible-source WHERE; the live-registration trigger is
+    # recreated verbatim because it was dropped in step 0 to unblock
+    # the table rename, not because it changed.
+    conn.execute(_V3_TRIGGER_RECEIPT_REQUIRES_LIVE_REGISTRATION)
+    conn.execute(_V3_TRIGGER_RECEIPT_ELIGIBLE)
+    conn.execute(_V3_TRIGGER_RECEIPT_MARKS_OBSERVED)
 
-            copied_registration_count = conn.execute(
-                "SELECT COUNT(*) FROM session_registrations"
-            ).fetchone()[0]
-            copied_delivery_count = conn.execute(
-                "SELECT COUNT(*) FROM targeted_deliveries"
-            ).fetchone()[0]
-            if copied_registration_count != registration_count:
-                raise sqlite3.IntegrityError(
-                    "session_registrations row count changed during v2→v3 "
-                    f"rebuild: expected {registration_count}, "
-                    f"copied {copied_registration_count}"
-                )
-            if copied_delivery_count != delivery_count:
-                raise sqlite3.IntegrityError(
-                    "targeted_deliveries row count changed during v2→v3 "
-                    f"rebuild: expected {delivery_count}, "
-                    f"copied {copied_delivery_count}"
-                )
+    # 4. FK integrity check — must be empty before COMMIT.
+    fk_violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if fk_violations:
+        raise sqlite3.IntegrityError(
+            f"foreign_key_check violations after v2→v3 rebuild: "
+            f"{fk_violations!r}"
+        )
 
-            # 3. Recreate the three receipt triggers. Two gain 'dispatching'
-            # in their eligible-source WHERE; the live-registration trigger is
-            # recreated verbatim because it was dropped in step 0 to unblock
-            # the table rename, not because it changed.
-            conn.execute(_V3_TRIGGER_RECEIPT_REQUIRES_LIVE_REGISTRATION)
-            conn.execute(_V3_TRIGGER_RECEIPT_ELIGIBLE)
-            conn.execute(_V3_TRIGGER_RECEIPT_MARKS_OBSERVED)
+    # 5. Record the new version row. Pinned to 3 here regardless of
+    # EXPECTED_SCHEMA_VERSION: this function is the v2→v3 hop only and
+    # must stay invariant to downstream version bumps (chained hops
+    # like v2→v3→v4 insert each row separately).
+    conn.execute(
+        "INSERT INTO awareness_schema_version "
+        "(version, applied_at, package_version) VALUES (?, ?, ?)",
+        (3, now, "0.4.0"),
+    )
 
-            # 4. FK integrity check — must be empty before COMMIT.
-            fk_violations = conn.execute("PRAGMA foreign_key_check").fetchall()
-            if fk_violations:
-                raise sqlite3.IntegrityError(
-                    f"foreign_key_check violations after v2→v3 rebuild: "
-                    f"{fk_violations!r}"
-                )
-
-            # 5. Record the new version row. Pinned to 3 here regardless of
-            # EXPECTED_SCHEMA_VERSION: this function is the v2→v3 hop only and
-            # must stay invariant to downstream version bumps (chained hops
-            # like v2→v3→v4 insert each row separately).
-            conn.execute(
-                "INSERT INTO awareness_schema_version "
-                "(version, applied_at, package_version) VALUES (?, ?, ?)",
-                (3, now, "0.4.0"),
-            )
-
-            conn.execute("COMMIT")
-        except Exception:
-            try:
-                conn.execute("ROLLBACK")
-            except sqlite3.Error:
-                pass
-            raise
-    finally:
-        # Restore FK enforcement on the way out, even on failure. Behavior
-        # per codex-manager seq=229 hardening:
-        #   - If a primary exception is already in flight, suppress any
-        #     restoration failure so it does not mask the primary error.
-        #     The caller sees the original migration failure, not a PRAGMA
-        #     side effect.
-        #   - If no primary exception is in flight (migration committed
-        #     successfully), verify the restoration read back `1` and raise
-        #     if it did not. A silent "FK restoration failed on the happy
-        #     path" would leave the caller with foreign-key enforcement
-        #     globally off until something else re-enables it.
-        import sys as _sys
-        primary_exc = _sys.exc_info()[0]
-        try:
-            conn.execute("PRAGMA foreign_keys = ON")
-            if primary_exc is None:
-                fk_on = conn.execute("PRAGMA foreign_keys").fetchone()
-                if fk_on is None or fk_on[0] != 1:
-                    raise sqlite3.OperationalError(
-                        "PRAGMA foreign_keys=ON could not be restored "
-                        "after migration"
-                    )
-        except sqlite3.Error:
-            if primary_exc is None:
-                raise
-        finally:
-            conn.close()
 
 
 # --- v3 → v4 migration -----------------------------------------------------
@@ -663,6 +670,7 @@ CREATE TABLE targeted_deliveries (
         delivery_state NOT IN ('claimed', 'dispatching')
         OR (claimant_session_uuid IS NOT NULL
             AND claim_lease_token IS NOT NULL
+            AND claim_lease_token <> ''
             AND claim_lease_expires_at IS NOT NULL)
     )
 )
@@ -670,7 +678,7 @@ CREATE TABLE targeted_deliveries (
 
 _V4_DISPATCH_OWNERSHIP = """
 CREATE TABLE dispatch_ownership (
-    claim_lease_token                   TEXT NOT NULL PRIMARY KEY,
+    claim_lease_token                   TEXT NOT NULL PRIMARY KEY CHECK (claim_lease_token <> ''),
     message_id                          TEXT NOT NULL,
     target_session_uuid                 TEXT NOT NULL,
     target_session_incarnation_id       TEXT NOT NULL,
@@ -717,7 +725,9 @@ def _v4_quiescence_refusal_reason(db: sqlite3.Connection) -> Optional[str]:
     The caller MUST hold an open connection to the pre-migration DB. Runs
     read-only; does not open a write transaction.
     """
-    rows = db.execute(
+    cur = db.cursor()
+    cur.row_factory = sqlite3.Row
+    rows = cur.execute(
         "SELECT delivery_state, COUNT(*) AS n FROM targeted_deliveries"
         " WHERE delivery_state IN ({})"
         " GROUP BY delivery_state"
@@ -733,136 +743,275 @@ def _v4_quiescence_refusal_reason(db: sqlite3.Connection) -> Optional[str]:
     )
 
 
-def _apply_v3_to_v4_migration(db_path: Path, *, now: int) -> None:
-    """Rebuild v3 → v4 under the SQLite FK PRAGMA discipline.
+def _v3_to_v4_ddl(conn: sqlite3.Connection, *, now: int) -> None:
+    """v3 → v4 rebuild statements, run inside the guarded hop's transaction.
 
-    Caller MUST have closed its own connection first. This function opens its
-    own connection, toggles PRAGMA foreign_keys outside any transaction,
-    rebuilds targeted_deliveries to add the three nullable claimant_* columns
-    and the two new CHECK constraints, creates the dispatch_ownership witness
-    table and its lookup index, inserts the schema-version row, and restores
-    foreign_keys=ON in the finally block (preserving the primary exception if
-    one is in flight, mirroring the v2→v3 discipline).
+    Adds the three nullable claimant_* columns and the two owner CHECKs to
+    targeted_deliveries, creates dispatch_ownership + its index, recreates
+    the receipt triggers (tr_receipt_marks_observed with the v4 body) and
+    inserts the version-4 row. Copies every v3 row verbatim; no owners are
+    invented.
     """
+
+    delivery_count = conn.execute(
+        "SELECT COUNT(*) FROM targeted_deliveries"
+    ).fetchone()[0]
+
+    # Receipt triggers reference targeted_deliveries; drop them so the
+    # table rename below is not blocked by SQLite 3.25+ trigger-body
+    # validation. They are recreated verbatim after the rebuild — only
+    # the targeted_deliveries CREATE text changes between v3 and v4.
+    conn.execute("DROP TRIGGER IF EXISTS tr_receipt_marks_observed")
+    conn.execute("DROP TRIGGER IF EXISTS tr_receipt_requires_eligible_delivery_state")
+    conn.execute("DROP TRIGGER IF EXISTS tr_receipt_requires_live_registration")
+
+    # Rebuild targeted_deliveries with the new CHECK constraints and
+    # three nullable owner-tuple columns. Copy every v3 row verbatim,
+    # setting the three new columns to NULL (no owner invention).
+    conn.execute(_V4_REBUILT_TARGETED_DELIVERIES.replace(
+        "CREATE TABLE targeted_deliveries",
+        "CREATE TABLE _new_targeted_deliveries",
+    ))
+    conn.execute(
+        "INSERT INTO _new_targeted_deliveries ("
+        "  message_id, target_session_uuid, target_session_incarnation_id,"
+        "  sender_session_uuid, sender_session_incarnation_id,"
+        "  delivery_state, claim_lease_token, claim_lease_expires_at,"
+        "  dispatch_started_at, created_at, attempt_count,"
+        "  next_attempt_at, expires_at, last_error_class"
+        ") SELECT "
+        "  message_id, target_session_uuid, target_session_incarnation_id,"
+        "  sender_session_uuid, sender_session_incarnation_id,"
+        "  delivery_state, claim_lease_token, claim_lease_expires_at,"
+        "  dispatch_started_at, created_at, attempt_count,"
+        "  next_attempt_at, expires_at, last_error_class "
+        "FROM targeted_deliveries"
+    )
+    conn.execute("DROP TABLE targeted_deliveries")
+    conn.execute(
+        "ALTER TABLE _new_targeted_deliveries "
+        "RENAME TO targeted_deliveries"
+    )
+    conn.execute(
+        "CREATE INDEX idx_delivery_eligible "
+        "ON targeted_deliveries(next_attempt_at) "
+        "WHERE delivery_state = 'pending'"
+    )
+
+    copied = conn.execute(
+        "SELECT COUNT(*) FROM targeted_deliveries"
+    ).fetchone()[0]
+    if copied != delivery_count:
+        raise sqlite3.IntegrityError(
+            "targeted_deliveries row count changed during v3→v4 "
+            f"rebuild: expected {delivery_count}, copied {copied}"
+        )
+
+    # Create the new witness table + its lookup index. These artifacts
+    # do not exist in v3 so no rebuild is needed.
+    conn.execute(_V4_DISPATCH_OWNERSHIP)
+    conn.execute(_V4_DISPATCH_OWNERSHIP_INDEX)
+
+    # Recreate the receipt triggers. tr_receipt_marks_observed gets
+    # the v4 body which also clears claimant_* on the observed row —
+    # the other two are unchanged from v3.
+    conn.execute(_V3_TRIGGER_RECEIPT_REQUIRES_LIVE_REGISTRATION)
+    conn.execute(_V3_TRIGGER_RECEIPT_ELIGIBLE)
+    conn.execute(_V4_TRIGGER_RECEIPT_MARKS_OBSERVED)
+
+    fk_violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if fk_violations:
+        raise sqlite3.IntegrityError(
+            f"foreign_key_check violations after v3→v4 rebuild: "
+            f"{fk_violations!r}"
+        )
+
+    conn.execute(
+        "INSERT INTO awareness_schema_version "
+        "(version, applied_at, package_version) VALUES (?, ?, ?)",
+        (EXPECTED_SCHEMA_VERSION, now, PACKAGE_VERSION),
+    )
+
+
+
+def _read_installed_version(db_path: Path) -> Optional[int]:
     conn = sqlite3.connect(str(db_path))
     try:
-        if conn.in_transaction:
-            raise sqlite3.OperationalError(
-                "v3→v4 migration requires a non-active transaction"
-            )
-        conn.execute("PRAGMA foreign_keys = OFF")
-        fk_off = conn.execute("PRAGMA foreign_keys").fetchone()
-        if fk_off is None or fk_off[0] != 0:
-            raise sqlite3.OperationalError(
-                "PRAGMA foreign_keys=OFF could not be set before v3→v4 migration"
-            )
-
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-
-            delivery_count = conn.execute(
-                "SELECT COUNT(*) FROM targeted_deliveries"
-            ).fetchone()[0]
-
-            # Receipt triggers reference targeted_deliveries; drop them so the
-            # table rename below is not blocked by SQLite 3.25+ trigger-body
-            # validation. They are recreated verbatim after the rebuild — only
-            # the targeted_deliveries CREATE text changes between v3 and v4.
-            conn.execute("DROP TRIGGER IF EXISTS tr_receipt_marks_observed")
-            conn.execute("DROP TRIGGER IF EXISTS tr_receipt_requires_eligible_delivery_state")
-            conn.execute("DROP TRIGGER IF EXISTS tr_receipt_requires_live_registration")
-
-            # Rebuild targeted_deliveries with the new CHECK constraints and
-            # three nullable owner-tuple columns. Copy every v3 row verbatim,
-            # setting the three new columns to NULL (no owner invention).
-            conn.execute(_V4_REBUILT_TARGETED_DELIVERIES.replace(
-                "CREATE TABLE targeted_deliveries",
-                "CREATE TABLE _new_targeted_deliveries",
-            ))
-            conn.execute(
-                "INSERT INTO _new_targeted_deliveries ("
-                "  message_id, target_session_uuid, target_session_incarnation_id,"
-                "  sender_session_uuid, sender_session_incarnation_id,"
-                "  delivery_state, claim_lease_token, claim_lease_expires_at,"
-                "  dispatch_started_at, created_at, attempt_count,"
-                "  next_attempt_at, expires_at, last_error_class"
-                ") SELECT "
-                "  message_id, target_session_uuid, target_session_incarnation_id,"
-                "  sender_session_uuid, sender_session_incarnation_id,"
-                "  delivery_state, claim_lease_token, claim_lease_expires_at,"
-                "  dispatch_started_at, created_at, attempt_count,"
-                "  next_attempt_at, expires_at, last_error_class "
-                "FROM targeted_deliveries"
-            )
-            conn.execute("DROP TABLE targeted_deliveries")
-            conn.execute(
-                "ALTER TABLE _new_targeted_deliveries "
-                "RENAME TO targeted_deliveries"
-            )
-            conn.execute(
-                "CREATE INDEX idx_delivery_eligible "
-                "ON targeted_deliveries(next_attempt_at) "
-                "WHERE delivery_state = 'pending'"
-            )
-
-            copied = conn.execute(
-                "SELECT COUNT(*) FROM targeted_deliveries"
-            ).fetchone()[0]
-            if copied != delivery_count:
-                raise sqlite3.IntegrityError(
-                    "targeted_deliveries row count changed during v3→v4 "
-                    f"rebuild: expected {delivery_count}, copied {copied}"
-                )
-
-            # Create the new witness table + its lookup index. These artifacts
-            # do not exist in v3 so no rebuild is needed.
-            conn.execute(_V4_DISPATCH_OWNERSHIP)
-            conn.execute(_V4_DISPATCH_OWNERSHIP_INDEX)
-
-            # Recreate the receipt triggers. tr_receipt_marks_observed gets
-            # the v4 body which also clears claimant_* on the observed row —
-            # the other two are unchanged from v3.
-            conn.execute(_V3_TRIGGER_RECEIPT_REQUIRES_LIVE_REGISTRATION)
-            conn.execute(_V3_TRIGGER_RECEIPT_ELIGIBLE)
-            conn.execute(_V4_TRIGGER_RECEIPT_MARKS_OBSERVED)
-
-            fk_violations = conn.execute("PRAGMA foreign_key_check").fetchall()
-            if fk_violations:
-                raise sqlite3.IntegrityError(
-                    f"foreign_key_check violations after v3→v4 rebuild: "
-                    f"{fk_violations!r}"
-                )
-
-            conn.execute(
-                "INSERT INTO awareness_schema_version "
-                "(version, applied_at, package_version) VALUES (?, ?, ?)",
-                (EXPECTED_SCHEMA_VERSION, now, PACKAGE_VERSION),
-            )
-
-            conn.execute("COMMIT")
-        except Exception:
-            try:
-                conn.execute("ROLLBACK")
-            except sqlite3.Error:
-                pass
-            raise
+        if not _has_table(conn, "awareness_schema_version"):
+            return None
+        row = conn.execute("SELECT MAX(version) FROM awareness_schema_version").fetchone()
+        return None if row is None else row[0]
     finally:
-        import sys as _sys
-        primary_exc = _sys.exc_info()[0]
+        conn.close()
+
+
+_ORDINARY_HOP_ERRORS = (sqlite3.Error, MigrationRefused, BackupVerificationFailure, OSError)
+
+
+def _guarded_hop(
+    db_path,
+    *,
+    now: int,
+    backup_dir,
+    source_version: int,
+    target_version: int,
+    ddl,
+) -> HopOutcome:
+    """Run one schema hop under the write lock (R9, v0.5.1 remediation).
+
+    Order: ``PRAGMA foreign_keys=OFF`` (outside any transaction) →
+    ``BEGIN IMMEDIATE`` → recheck version / exact source schema / quiescence
+    under the lock → record preserved-table counts → per-hop backup through
+    ``create_backup``'s separate read connection → ``ddl`` → exact destination
+    schema + ``foreign_key_check`` + preservation counts + version row, all
+    BEFORE ``COMMIT`` → ``COMMIT`` → restore ``PRAGMA foreign_keys=ON``.
+
+    Exception dispatch: ordinary errors (SQLite, refusal, backup, OSError,
+    FK restoration) are converted to a ``HopOutcome`` after guarded cleanup
+    and never propagate; the primary error is preserved if cleanup also
+    fails; a failure after a successful COMMIT reports the destination
+    version and is never described as rolled back. ``KeyboardInterrupt`` /
+    ``SystemExit`` run the same cleanup and then propagate.
+    """
+    db_path = Path(db_path)
+    backup_dir = Path(backup_dir)
+    backup: Optional[BackupResult] = None
+    unverified: Optional[Path] = None
+    committed = False
+    primary: Optional[BaseException] = None
+    restore_error: Optional[BaseException] = None
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        try:
+            if conn.in_transaction:
+                raise sqlite3.OperationalError(
+                    f"v{source_version}→v{target_version} migration requires a "
+                    "non-active transaction"
+                )
+            conn.execute("PRAGMA foreign_keys = OFF")
+            fk_off = conn.execute("PRAGMA foreign_keys").fetchone()
+            if fk_off is None or fk_off[0] != 0:
+                raise sqlite3.OperationalError(
+                    "PRAGMA foreign_keys=OFF could not be set before migration"
+                )
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT MAX(version) FROM awareness_schema_version"
+                ).fetchone()
+                found = None if row is None else row[0]
+                if found != source_version:
+                    raise MigrationRefused(
+                        f"schema version changed under lock: expected "
+                        f"{source_version}, found {found}"
+                    )
+                mismatch = _validate_schema_exact(conn, version=source_version)
+                if mismatch:
+                    raise MigrationRefused(
+                        f"source schema is not canonical v{source_version} under "
+                        f"lock: {mismatch}"
+                    )
+                refusal = _v4_quiescence_refusal_reason(conn)
+                if refusal is not None:
+                    raise MigrationRefused(refusal)
+                pre_counts = {
+                    t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                    for t in _PRESERVED_TABLES if _has_table(conn, t)
+                }
+                try:
+                    backup = create_backup(
+                        db_path, backup_dir=backup_dir,
+                        expected_managed_artifacts=_managed_set_for(source_version),
+                        managed_namespace_names=_managed_namespace_names(),
+                        now=now, suffix=f".from-v{source_version}",
+                    )
+                except BackupVerificationFailure as exc:
+                    unverified = exc.path
+                    raise
+                ddl(conn, now=now)
+                mismatch = _validate_schema_exact(conn, version=target_version)
+                if mismatch:
+                    raise sqlite3.IntegrityError(
+                        f"destination schema is not canonical v{target_version}: "
+                        f"{mismatch}"
+                    )
+                fk_violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+                if fk_violations:
+                    raise sqlite3.IntegrityError(
+                        f"foreign_key_check violations after v{source_version}→"
+                        f"v{target_version} rebuild: {fk_violations!r}"
+                    )
+                for table, before in pre_counts.items():
+                    after = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    if after != before:
+                        raise sqlite3.IntegrityError(
+                            f"preservation check failed: {table} had {before} rows "
+                            f"before the hop, {after} after"
+                        )
+                vrow = conn.execute(
+                    "SELECT 1 FROM awareness_schema_version WHERE version = ?",
+                    (target_version,),
+                ).fetchone()
+                if vrow is None:
+                    raise sqlite3.IntegrityError(
+                        f"version row {target_version} missing before commit"
+                    )
+                conn.execute("COMMIT")
+                committed = True
+            except BaseException:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+        except _ORDINARY_HOP_ERRORS as exc:
+            primary = exc
+    finally:
+        # Restore FK enforcement even on failure. A restoration failure never
+        # masks a primary error; on the happy path the readback must be 1.
         try:
             conn.execute("PRAGMA foreign_keys = ON")
-            if primary_exc is None:
+            if primary is None:
                 fk_on = conn.execute("PRAGMA foreign_keys").fetchone()
                 if fk_on is None or fk_on[0] != 1:
                     raise sqlite3.OperationalError(
-                        "PRAGMA foreign_keys=ON could not be restored "
-                        "after v3→v4 migration"
+                        "PRAGMA foreign_keys=ON could not be restored after migration"
                     )
-        except sqlite3.Error:
-            if primary_exc is None:
-                raise
+        except sqlite3.Error as exc:
+            if primary is None:
+                restore_error = exc
         finally:
             conn.close()
+
+    version_after = _read_installed_version(db_path)
+    if primary is None and restore_error is None:
+        return HopOutcome("applied", version_after, backup=backup)
+    if primary is None:
+        prefix = "committed; " if committed else ""
+        return HopOutcome(
+            "failed", version_after,
+            reason=f"{prefix}foreign_keys restoration failed: {restore_error}",
+            backup=backup,
+        )
+    if isinstance(primary, MigrationRefused):
+        return HopOutcome("refused", version_after, reason=str(primary))
+    return HopOutcome(
+        "failed", version_after,
+        reason=f"v{source_version}→v{target_version} migration failed: {primary}",
+        backup=backup, unverified_backup_path=unverified,
+    )
+
+
+def _apply_v2_to_v3_migration(db_path, *, now: int, backup_dir) -> HopOutcome:
+    """Guarded v2 → v3 hop (accepted v0.4 rebuild, now under the lock discipline)."""
+    return _guarded_hop(db_path, now=now, backup_dir=backup_dir,
+                        source_version=2, target_version=3, ddl=_v2_to_v3_ddl)
+
+
+def _apply_v3_to_v4_migration(db_path, *, now: int, backup_dir) -> HopOutcome:
+    """Guarded v3 → v4 hop."""
+    return _guarded_hop(db_path, now=now, backup_dir=backup_dir,
+                        source_version=3, target_version=4, ddl=_v3_to_v4_ddl)
 
 
 # --- apply / rollback ------------------------------------------------------
@@ -954,6 +1103,14 @@ def apply(
                         version=installed_version,
                         reason=refusal,
                     )
+                mismatch = _validate_schema_exact(db, version=installed_version)
+                if mismatch:
+                    return MigrationResult(
+                        status="refused",
+                        version=installed_version,
+                        reason=(f"source schema is not canonical "
+                                f"v{installed_version}: {mismatch}"),
+                    )
                 if dry_run:
                     chain = ("v2→v3→v4" if installed_version == 2 else "v3→v4")
                     return MigrationResult(
@@ -961,30 +1118,31 @@ def apply(
                         version=EXPECTED_SCHEMA_VERSION,
                         reason=f"dry_run {chain}",
                     )
-                backup = create_backup(
-                    db_path, backup_dir=backup_dir,
-                    # Pre-migration shape: v2 and v3 share the same
-                    # sqlite_master managed set (dispatch_ownership + its index
-                    # are v4-only), so the pre-v4 set verifies both.
-                    expected_managed_artifacts=_pre_v4_managed_set(),
-                    managed_namespace_names=_managed_namespace_names(),
-                    now=now,
-                )
                 db.close()
-                try:
-                    if installed_version == 2:
-                        _apply_v2_to_v3_migration(db_path, now=now)
-                    _apply_v3_to_v4_migration(db_path, now=now)
-                except sqlite3.Error as exc:
-                    return MigrationResult(
-                        status="failed",
-                        reason=(
-                            f"v{installed_version}→v{EXPECTED_SCHEMA_VERSION} "
-                            f"migration failed: {exc}"
-                        ),
-                    )
-                # Reopen for post-apply validation (mirrors fresh-install
-                # path below).
+                # Each hop locks, rechecks, backs up and validates itself; a
+                # non-applied outcome carries that hop's backup (or the last
+                # applied hop's) and the actual version left behind.
+                last_applied_backup = None
+                hops = ([_apply_v2_to_v3_migration] if installed_version == 2 else []) + [
+                    _apply_v3_to_v4_migration
+                ]
+                for hop in hops:
+                    outcome = hop(db_path, now=now, backup_dir=backup_dir)
+                    if outcome.status != "applied":
+                        reason = outcome.reason
+                        if outcome.unverified_backup_path is not None:
+                            reason += (f" (unverified backup file left at "
+                                       f"{outcome.unverified_backup_path})")
+                        return MigrationResult(
+                            status=outcome.status,
+                            version=outcome.version_after,
+                            reason=reason,
+                            backup=outcome.backup or last_applied_backup,
+                        )
+                    last_applied_backup = outcome.backup
+                backup = last_applied_backup
+                # Reopen for post-apply confirmation (the hop already validated
+                # the destination before committing).
                 db = sqlite3.connect(str(db_path))
                 db.execute("PRAGMA foreign_keys = ON")
                 post_state = _collect_managed_state(db)
@@ -994,12 +1152,14 @@ def apply(
                     return MigrationResult(
                         status="failed",
                         reason="post-migration: managed artifacts not all present",
+                        backup=backup,
                     )
                 mismatch = _validate_sql_text_matches_canonical(post_state)
                 if mismatch:
                     return MigrationResult(
                         status="failed",
                         reason=f"post-migration SQL mismatch: {mismatch}",
+                        backup=backup,
                     )
                 db.row_factory = sqlite3.Row
                 row = db.execute(
@@ -1011,6 +1171,7 @@ def apply(
                     return MigrationResult(
                         status="failed",
                         reason="post-migration: version row missing",
+                        backup=backup,
                     )
                 return MigrationResult(
                     status="applied",
@@ -1118,92 +1279,125 @@ def rollback(
     if not db_path.exists():
         return RollbackResult(status="failed", reason=f"db does not exist: {db_path}")
 
-    db = sqlite3.connect(str(db_path))
+    db = sqlite3.connect(str(db_path), isolation_level=None)
     try:
         db.row_factory = sqlite3.Row
+        # Every refusal check, the source-schema check, the backup and the
+        # drops run under ONE write lock (R9 / v0.5.1 I09+I10): no writer can
+        # change what was checked before it is destroyed.
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            def _refuse(reason: str) -> RollbackResult:
+                db.execute("ROLLBACK")
+                return RollbackResult(status="refused", reason=reason)
 
-        lease_row = (
-            db.execute("SELECT expires_at FROM dispatcher_lease WHERE singleton_pk = 1").fetchone()
-            if _has_table(db, "dispatcher_lease") else None
-        )
-        if lease_row is not None and lease_row["expires_at"] > now:
-            return RollbackResult(
-                status="refused",
-                reason="dispatcher_lease has a live holder; wait for release",
+            lease_row = (
+                db.execute("SELECT expires_at FROM dispatcher_lease WHERE singleton_pk = 1").fetchone()
+                if _has_table(db, "dispatcher_lease") else None
             )
+            if lease_row is not None and lease_row["expires_at"] > now:
+                return _refuse("dispatcher_lease has a live holder; wait for release")
 
-        in_flight = (
-            db.execute(
-                "SELECT COUNT(*) FROM targeted_deliveries "
-                "WHERE delivery_state IN ('claimed', 'dispatching', 'notified', 'ambiguous', 'blocked')"
-            ).fetchone()[0]
-            if _has_table(db, "targeted_deliveries") else 0
-        )
-        if in_flight > 0:
-            return RollbackResult(
-                status="refused",
-                reason=f"{in_flight} in-flight deliveries; drive to terminal via reconciliation first",
+            in_flight = (
+                db.execute(
+                    "SELECT COUNT(*) FROM targeted_deliveries "
+                    "WHERE delivery_state IN ('claimed', 'dispatching', 'notified', 'ambiguous', 'blocked')"
+                ).fetchone()[0]
+                if _has_table(db, "targeted_deliveries") else 0
             )
+            if in_flight > 0:
+                return _refuse(
+                    f"{in_flight} in-flight deliveries; drive to terminal via reconciliation first"
+                )
 
-        # v0.5.0 (R4): refuse teardown when any dispatch_ownership witness has
-        # no matching targeted_deliveries row. Normally the FK prevents this,
-        # but a prior pathological state (e.g. FK-off repair) could leave
-        # orphaned witnesses; silently dropping them would discard the sole
-        # historical proof of a given lease_token's claimant.
-        unmatched_witness = (
-            db.execute(
-                "SELECT COUNT(*) FROM dispatch_ownership d"
-                " WHERE NOT EXISTS ("
-                "   SELECT 1 FROM targeted_deliveries t"
-                "   WHERE t.message_id = d.message_id"
-                "     AND t.target_session_uuid = d.target_session_uuid"
-                "     AND t.target_session_incarnation_id = d.target_session_incarnation_id"
-                " )"
-            ).fetchone()[0]
-            if _has_table(db, "dispatch_ownership") else 0
-        )
-        if unmatched_witness > 0:
-            return RollbackResult(
-                status="refused",
-                reason=(
+            # R4: never drop a witness whose delivery row is missing ...
+            unmatched_witness = (
+                db.execute(
+                    "SELECT COUNT(*) FROM dispatch_ownership d"
+                    " WHERE NOT EXISTS ("
+                    "   SELECT 1 FROM targeted_deliveries t"
+                    "   WHERE t.message_id = d.message_id"
+                    "     AND t.target_session_uuid = d.target_session_uuid"
+                    "     AND t.target_session_incarnation_id = d.target_session_incarnation_id"
+                    " )"
+                ).fetchone()[0]
+                if _has_table(db, "dispatch_ownership") else 0
+            )
+            if unmatched_witness > 0:
+                return _refuse(
                     f"{unmatched_witness} dispatch_ownership witness rows have "
                     "no matching delivery; manual review required (R4: no "
                     "destructive teardown of unmatched witnesses)"
-                ),
+                )
+            # ... nor one whose entered attempt was never recorded (token AND
+            # full delivery key must match a queue_attempts row). The witness
+            # is the only proof that lets the entered owner finalize late.
+            unfinalized_witness = (
+                db.execute(
+                    "SELECT COUNT(*) FROM dispatch_ownership d"
+                    " WHERE NOT EXISTS ("
+                    "   SELECT 1 FROM queue_attempts a"
+                    "   WHERE a.claim_lease_token = d.claim_lease_token"
+                    "     AND a.message_id = d.message_id"
+                    "     AND a.target_session_uuid = d.target_session_uuid"
+                    "     AND a.target_session_incarnation_id = d.target_session_incarnation_id"
+                    " )"
+                ).fetchone()[0]
+                if _has_table(db, "dispatch_ownership") and _has_table(db, "queue_attempts") else 0
+            )
+            if unfinalized_witness > 0:
+                return _refuse(
+                    f"{unfinalized_witness} dispatch_ownership witness rows have "
+                    "no recorded attempt (entered, unfinalized); the entered owner "
+                    "must finalize, or an evidenced manual reconciliation must "
+                    "record the outcome, before teardown (R4)"
+                )
+
+            live_caps = (
+                db.execute(
+                    "SELECT COUNT(*) FROM session_capabilities "
+                    "WHERE revoked_at IS NULL AND expires_at > ?",
+                    (now,),
+                ).fetchone()[0]
+                if _has_table(db, "session_capabilities") else 0
+            )
+            if live_caps > 0:
+                return _refuse(f"{live_caps} live capabilities; revoke or wait for expiry")
+
+            installed = None
+            if _has_table(db, "awareness_schema_version"):
+                vrow = db.execute("SELECT MAX(version) AS v FROM awareness_schema_version").fetchone()
+                installed = None if vrow is None else vrow["v"]
+            if installed not in _HISTORICAL_SCHEMA_FILES and installed != EXPECTED_SCHEMA_VERSION:
+                return _refuse(
+                    f"installed schema version {installed!r} is not a known canonical "
+                    "version; manual review required"
+                )
+            mismatch = _validate_schema_exact(db, version=installed)
+            if mismatch:
+                return _refuse(
+                    f"source schema is not canonical v{installed}; refusing guarded "
+                    f"removal: {mismatch}"
+                )
+
+            if dry_run:
+                db.execute("ROLLBACK")
+                return RollbackResult(status="rolled_back", reason="dry_run")
+
+            preserved_ids = (
+                tuple(r[0] for r in db.execute(
+                    "SELECT DISTINCT message_id FROM targeted_deliveries"
+                ).fetchall())
+                if _has_table(db, "targeted_deliveries") else ()
             )
 
-        live_caps = (
-            db.execute(
-                "SELECT COUNT(*) FROM session_capabilities "
-                "WHERE revoked_at IS NULL AND expires_at > ?",
-                (now,),
-            ).fetchone()[0]
-            if _has_table(db, "session_capabilities") else 0
-        )
-        if live_caps > 0:
-            return RollbackResult(
-                status="refused",
-                reason=f"{live_caps} live capabilities; revoke or wait for expiry",
+            backup = create_backup(
+                db_path, backup_dir=backup_dir,
+                expected_managed_artifacts=_managed_set_for(installed),
+                managed_namespace_names=_managed_namespace_names(),
+                now=now,
             )
 
-        if dry_run:
-            return RollbackResult(status="rolled_back", reason="dry_run")
-
-        preserved_ids = (
-            tuple(r[0] for r in db.execute(
-                "SELECT DISTINCT message_id FROM targeted_deliveries"
-            ).fetchall())
-            if _has_table(db, "targeted_deliveries") else ()
-        )
-
-        backup = create_backup(
-            db_path, backup_dir=backup_dir,
-            expected_managed_artifacts=_expected_managed_set(),
-            managed_namespace_names=_managed_namespace_names(),
-            now=now,
-        )
-
-        with db:
             for kind, name in _DROP_ORDER:
                 if kind == "trigger":
                     db.execute(f"DROP TRIGGER IF EXISTS {name}")
@@ -1211,6 +1405,13 @@ def rollback(
                     db.execute(f"DROP INDEX IF EXISTS {name}")
                 elif kind == "table":
                     db.execute(f"DROP TABLE IF EXISTS {name}")
+            db.execute("COMMIT")
+        except BaseException:
+            try:
+                db.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
 
         remaining = _collect_managed_state(db)
         if remaining["any_managed_present"]:

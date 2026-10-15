@@ -14,7 +14,12 @@ from typing import Iterable
 
 
 class BackupVerificationFailure(Exception):
-    pass
+    """A captured backup failed verification. ``path`` names the unverified
+    file left on disk; callers must never report it as a verified backup."""
+
+    def __init__(self, message: str, *, path: "Path | None" = None):
+        super().__init__(message)
+        self.path = path
 
 
 @dataclass(frozen=True)
@@ -67,12 +72,18 @@ def create_backup(
     expected_managed_artifacts: Iterable[tuple[str, str]],
     managed_namespace_names: Iterable[str],
     now: int,
+    suffix: str = "",
 ) -> BackupResult:
     """Capture a WAL-safe snapshot and verify it independently.
 
     expected_managed_artifacts is a set of (type, name) pairs the caller
     expects to find in the backup. Used by apply (pre-migration shape = none)
     and rollback (pre-rollback shape = all managed artifacts present).
+
+    The capture always runs on its own read connection (SQLite online backup
+    API), so a caller may hold a write transaction on another connection;
+    the snapshot is the last committed state. ``suffix`` lets per-hop callers
+    name their backups distinctly (e.g. ``.from-v3``).
     """
     source_db_path = Path(source_db_path)
     backup_dir = Path(backup_dir)
@@ -80,7 +91,7 @@ def create_backup(
         raise FileNotFoundError(f"source DB does not exist: {source_db_path}")
 
     backup_dir.mkdir(parents=True, exist_ok=True, mode=0o755)
-    backup_name = f"bridge.db.{_utc_iso_no_colons(now)}.sqlite"
+    backup_name = f"bridge.db.{_utc_iso_no_colons(now)}{suffix}.sqlite"
     backup_path = backup_dir / backup_name
     if backup_path.exists():
         raise FileExistsError(f"backup already exists at timestamp: {backup_path}")
@@ -122,15 +133,16 @@ def create_backup(
 
     if not integrity_ok:
         raise BackupVerificationFailure(
-            f"integrity_check failed on backup: {integrity_rows!r}"
+            f"integrity_check failed on backup: {integrity_rows!r}", path=backup_path
         )
     if not fk_ok:
         raise BackupVerificationFailure(
-            f"foreign_key_check failed on backup: {fk_rows!r}"
+            f"foreign_key_check failed on backup: {fk_rows!r}", path=backup_path
         )
     if not schema_ok:
         raise BackupVerificationFailure(
-            f"schema diff on backup: expected={sorted(expected_set)}, actual={sorted(actual_managed)}"
+            f"schema diff on backup: expected={sorted(expected_set)}, actual={sorted(actual_managed)}",
+            path=backup_path,
         )
 
     return BackupResult(

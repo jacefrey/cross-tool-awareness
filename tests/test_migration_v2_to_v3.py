@@ -638,16 +638,27 @@ def test_fk_restoration_failure_does_not_mask_primary_migration_error(tmp_path):
             return self._real.in_transaction
 
     real_connect = sqlite3.connect
+    wrapped = {"n": 0}
 
     def _wrapped_connect(*args, **kwargs):
-        return _DualFailureConn(real_connect(*args, **kwargs))
+        # Proxy only the hop's own connection (the first one opened); the
+        # guarded hop's backup and version re-read use plain connections.
+        wrapped["n"] += 1
+        conn = real_connect(*args, **kwargs)
+        return _DualFailureConn(conn) if wrapped["n"] == 1 else conn
 
     original = mig.sqlite3.connect
     mig.sqlite3.connect = _wrapped_connect
     try:
-        with pytest.raises(sqlite3.IntegrityError,
-                           match="foreign_key_check violations"):
-            _apply_v2_to_v3_migration(path, now=2_000_000)
+        # v0.5.1: ordinary hop errors are reported as a failed HopOutcome
+        # (never raised); the PRIMARY error must be the one reported and the
+        # secondary restoration error must not mask it.
+        outcome = _apply_v2_to_v3_migration(path, now=2_000_000,
+                                            backup_dir=tmp_path / "hop-backups")
+        assert outcome.status == "failed"
+        assert "foreign_key_check violations" in outcome.reason
+        assert "toggle refused" not in outcome.reason
+        assert outcome.version_after == 2
     finally:
         mig.sqlite3.connect = original
 
@@ -694,16 +705,27 @@ def test_fk_restoration_raises_on_happy_path_if_readback_mismatches(tmp_path):
             return self._real.in_transaction
 
     real_connect = sqlite3.connect
+    wrapped = {"n": 0}
 
     def _wrapped_connect(*args, **kwargs):
-        return _ReadbackSubvertConn(real_connect(*args, **kwargs))
+        # Proxy only the hop's own connection (the first one opened); the
+        # guarded hop's backup and version re-read use plain connections.
+        wrapped["n"] += 1
+        conn = real_connect(*args, **kwargs)
+        return _ReadbackSubvertConn(conn) if wrapped["n"] == 1 else conn
 
     original = mig.sqlite3.connect
     mig.sqlite3.connect = _wrapped_connect
     try:
-        with pytest.raises(sqlite3.OperationalError,
-                           match="PRAGMA foreign_keys=ON could not be restored"):
-            _apply_v2_to_v3_migration(path, now=2_000_000)
+        # v0.5.1: the hop committed, so the outcome reports the destination
+        # version and the restoration failure explicitly (never "rolled back").
+        outcome = _apply_v2_to_v3_migration(path, now=2_000_000,
+                                            backup_dir=tmp_path / "hop-backups")
+        assert outcome.status == "failed"
+        assert "PRAGMA foreign_keys=ON could not be restored" in outcome.reason
+        assert outcome.reason.startswith("committed;")
+        assert outcome.version_after == 3
+        assert outcome.backup is not None
     finally:
         mig.sqlite3.connect = original
 
@@ -739,7 +761,10 @@ def test_migration_refuses_active_transaction(tmp_path):
     original = mig.sqlite3.connect
     mig.sqlite3.connect = _fake_connect
     try:
-        with pytest.raises(sqlite3.OperationalError, match="non-active transaction"):
-            _apply_v2_to_v3_migration(path, now=2_000_000)
+        outcome = _apply_v2_to_v3_migration(path, now=2_000_000,
+                                            backup_dir=tmp_path / "hop-backups")
+        assert outcome.status == "failed"
+        assert "non-active transaction" in outcome.reason
+        assert outcome.version_after == 2 and outcome.backup is None
     finally:
         mig.sqlite3.connect = original

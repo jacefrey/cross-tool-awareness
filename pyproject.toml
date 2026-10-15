@@ -17,4 +17,4 @@ test = ["pytest>=8.0"]
 where = ["src"]
 
 [tool.setuptools.package-data]
-cross_tool_awareness = ["schema.sql"]
+cross_tool_awareness = ["schema.sql", "schema_v2.sql", "schema_v3.sql"]

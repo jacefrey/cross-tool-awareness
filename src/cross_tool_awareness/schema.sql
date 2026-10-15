@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS targeted_deliveries (
         delivery_state NOT IN ('claimed', 'dispatching')
         OR (claimant_session_uuid IS NOT NULL
             AND claim_lease_token IS NOT NULL
+            AND claim_lease_token <> ''
             AND claim_lease_expires_at IS NOT NULL)
     )
 );
@@ -235,7 +236,7 @@ CREATE TABLE IF NOT EXISTS notice_claims (
 -- receipt won first. No garbage-collection job: retention/rollback preserves
 -- this history and refuses destructive teardown of unmatched witnesses.
 CREATE TABLE IF NOT EXISTS dispatch_ownership (
-    claim_lease_token                   TEXT NOT NULL PRIMARY KEY,
+    claim_lease_token                   TEXT NOT NULL PRIMARY KEY CHECK (claim_lease_token <> ''),
     message_id                          TEXT NOT NULL,
     target_session_uuid                 TEXT NOT NULL,
     target_session_incarnation_id       TEXT NOT NULL,
