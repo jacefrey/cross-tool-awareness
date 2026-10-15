@@ -96,7 +96,16 @@ Rules the package enforces (design R5–R8):
   still own a valid pre-entry claim, or release to `blocked`. Never
   auto-retry an entered or ambiguous dispatch. The 30 s proof-age window
   is a maximum age, not a guarantee the snapshot stays valid.
-- **Pre-entry release preserves `next_attempt_at`.**
+- **The adapter gate honors the fence captured at claim time.** The
+  facade's `pre_adapter_mark` passes `claim.target_registration_fence`; a
+  target whose fence rotated since the claim is refused even if you
+  re-snapshotted after the rotation. Release to `blocked` and claim afresh.
+- **Pre-entry release preserves `next_attempt_at`** and accepts only
+  `pending` or `blocked` (`ValueError` otherwise).
+- **A transient SQLite error does not kill your connection.** Disk-full,
+  `interrupt()` and I/O errors are rolled back by SQLite itself; the
+  package re-raises them and leaves the connection usable. It closes the
+  connection only when a transaction survives a failed `ROLLBACK`.
 - **Finalization is exactly-once.** An exact retry is idempotent
   (`already_finalized`); any altered field under the same token is
   rejected (`altered_retry_rejected`); a wrong owner with a known token is

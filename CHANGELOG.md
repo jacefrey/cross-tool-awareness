@@ -89,6 +89,16 @@ The package remains fixture-only and is not authorized for live use.
   before any backup; a non-`applied` result after a committed hop carries
   that hop's backup; `MigrationRefused` and `HopOutcome` are new internals.
 - `create_backup(..., suffix="")`; `BackupVerificationFailure.path`.
+- `leases.pre_adapter_mark(..., target_registration_fence: Optional[str] = None)`;
+  `CompositeStorage.pre_adapter_mark` passes the fence captured on the
+  `ClaimedDelivery`, so a target whose fence rotated since the claim is
+  refused at the adapter gate even after a re-snapshot (fresh-review fix).
+- `leases.pre_adapter_release` raises `ValueError` (not a strippable
+  `assert`) for a `next_state` outside `pending`/`blocked`.
+- The transaction envelope tolerates SQLite's own auto-rollback
+  (`SQLITE_FULL`, `interrupt()`, I/O errors): the consumer's connection
+  stays open and usable; it is closed only when a transaction survives a
+  failed `ROLLBACK`.
 - Consumer rule for ruling R-S (confirmed by codex-manager): a registration
   expiry extension between snapshot and mark invalidates the snapshot —
   refuse, re-observe/re-snapshot outside the transaction while still
